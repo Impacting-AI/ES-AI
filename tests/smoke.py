@@ -1,0 +1,95 @@
+"""Run inside the built app container against a DISPOSABLE compose database."""
+import base64
+import hashlib
+import hmac
+import json
+import secrets
+import struct
+import time
+import uuid
+from pathlib import Path
+import httpx
+from server.db import database,cipher
+from server.domain import password_hash
+import os
+
+
+def run():
+    secret=secrets.token_bytes(20)
+    login=str(uuid.uuid4())
+    password=secrets.token_urlsafe(24)
+    with database() as db:
+        db.execute(Path('server/schema.sql').read_text())
+        db.execute('INSERT INTO users(id,login,password,otp_encrypted,platform_role) VALUES (%s,%s,%s,%s,%s)',(login,login,password_hash(password),cipher().encrypt(base64.b32encode(secret)).decode(),"Super Admin"))
+    headers={'Origin':os.environ['PUBLIC_ORIGIN']}
+    with httpx.Client(base_url='http://localhost:8080/api/',headers=headers) as c:
+        assert c.get('projects').status_code==401
+        digest=hmac.digest(secret,struct.pack('>Q',int(time.time())//30),'sha1')
+        i=digest[-1]&15
+        code=f'{(int.from_bytes(digest[i:i+4],"big") & 0x7fffffff)%1000000:06}'
+        c.post('login',json=dict(login=login,password=password,code=code)).raise_for_status()
+        pid=c.post('projects',json=dict(name='Smoke test',client='Fixture')).raise_for_status().json()['id']
+        base=f'projects/{pid}/'
+        def upload(name,body,family=''):
+            return c.post(base+'files',data=dict(title=name,category='Scope',origin='Fixture',family=family),files={'file':('scope.txt',body)}).raise_for_status().json()['id']
+        registry=c.get('agents').raise_for_status().json()
+        assert registry[0]['id']=='pm-ai-es'
+        cfg=c.get('agents/pm-ai-es').raise_for_status().json()
+        policy=dict(cfg['policy'],enabled=False)
+        c.put('agents/pm-ai-es/settings',json=dict(revision=cfg['revision'],policy=policy)).raise_for_status()
+        assert c.post(base+'agent',json={'action':'health'}).status_code==403
+        cfg=c.get('agents/pm-ai-es').raise_for_status().json()
+        c.put('agents/pm-ai-es/settings',json=dict(revision=cfg['revision'],policy=dict(policy,enabled=True))).raise_for_status()
+        assert 'answer' in c.post(base+'agent',json={'action':'auto','question':'Check project health'}).raise_for_status().json()
+        first=upload('Scope v1','Panel thickness 2 mm')
+        c.post(base+'sources/'+first+'/approve').raise_for_status()
+        second=upload('Scope v2','Panel thickness 3 mm',first)
+        assert c.get(base+'search',params={'q':'thickness'}).json()[0]['state']=='approved'
+        c.post(base+'sources/'+second+'/approve').raise_for_status()
+        assert all('2 mm' not in s['body'] for s in c.get(base+'search',params={'q':'thickness'}).json())
+        c.post(base+'messages',json=dict(body='Proposed blue finish',respond=False)).raise_for_status()
+        assert c.get(base+'workspace').json()['messages']==[]
+        assert c.get('projects/'+str(uuid.uuid4())+'/sources/'+second).status_code==404
+        assert c.post(base+'messages',headers={'Origin':'https://other.invalid'},json=dict(body='x',respond=False)).status_code==403
+        rule={"frequency":"Weekly","zone":"Asia/Karachi","weekday":0,"hour":8,"audience":"CEO","heading":"Weekly delivery review","recipient":"review@example.invalid"}
+        c.put(base+"report-rule",json=rule).raise_for_status()
+        assert c.get(base+"report-rule").json()==rule
+        today=time.strftime("%Y-%m-%d")
+        rid=c.post(base+"report-drafts",json={"start":today,"end":today,"audience":"CEO"}).raise_for_status().json()["id"]
+        c.put(base+"report-drafts/"+rid,json={"body":"Reviewed snapshot","revision":1}).raise_for_status()
+        assert c.put(base+"report-drafts/"+rid,json={"body":"Stale","revision":1}).status_code==409
+        c.patch("projects/"+pid,json={"name":"Audit","client":"Fixture","expertise":"React","target":today}).raise_for_status()
+        assert any(p["profile"].get("expertise")=="React" for p in c.get("projects").json())
+        with database() as db:
+            plan=str(uuid.uuid4())
+            db.execute("INSERT INTO plans(id,pid,content) VALUES(%s,%s,%s)",(plan,pid,"Fixture output"))
+        fid=c.post(base+"feedback",json={"target":plan,"category":"Scope","body":"Missing source reference"}).raise_for_status().json()["id"]
+        assert c.get(base+"improvements").json()[0]["status"]=="draft"
+        c.post(base+"improvements/"+fid,json={"approve":True,"evaluation":"Compared proposed rule with approved scope."}).raise_for_status()
+        assert c.get(base+"improvements").json()[0]["status"]=="approved"
+        from tests.test_knowledge_chat import docx
+        marker="ATLAS-"+uuid.uuid4().hex[:12]
+        sample=c.post(base+"files",data={"title":"Acceptance annex","category":"Agreement","origin":"QA"},files={"file":("annex.docx",docx("Handover requires "+marker))}).raise_for_status().json()
+        assert sample["processing"]=="Ready"
+        assert c.get(base+"search",params={"q":marker}).raise_for_status().json()[0]["sid"]==sample["id"]
+        thread=c.post(base+"chats",json={"title":"Delivery discussion"}).raise_for_status().json()
+        path=base+"chats/"+thread["id"]
+        c.post(path+"/turn",json={"revision":0,"body":"Record the handover meeting","respond":False}).raise_for_status()
+        messages=c.get(path).raise_for_status().json()["messages"]
+        assert len(messages)==1 and messages[0]["role"]=="user"
+        branch=c.post(path+"/branch/"+messages[0]["id"]).raise_for_status().json()
+        assert c.get(base+"chats/"+branch["id"]).raise_for_status().json()["messages"]==[]
+        c.patch(path,json={"title":"Renamed handover"}).raise_for_status()
+        assert any(t["id"]==thread["id"] for t in c.get(base+"chats?q=Renamed").json())
+        p2=c.post("projects",json={"name":"Other project","client":"QA"}).raise_for_status().json()["id"]
+        assert c.get("projects/"+p2+"/chats/"+thread["id"]).status_code==404
+        assert c.get("projects/"+p2+"/search",params={"q":marker}).raise_for_status().json()==[]
+        failed=c.post(base+"files",data={"title":"Unreadable","category":"Scope","origin":"QA"},files={"file":("bad.docx",b"damaged")}).raise_for_status().json()
+        assert failed["processing"]=="Failed"
+        assert c.post(base+"sources/"+failed["id"]+"/retry").raise_for_status().json()["error"]
+        c.post('logout').raise_for_status()
+        assert c.get('projects').status_code==401
+    print("HTTP smoke checks passed.")
+
+
+if __name__=='__main__': run()

@@ -1,0 +1,12 @@
+import React,{useEffect,useState} from 'react'
+import ReportRule from './ReportRule'
+import {api} from './api'
+type Row=Record<string,any>
+export default function Reports({pid,canEdit}:{pid:string,canEdit:boolean}){
+ const base='projects/'+pid+'/',[rows,set]=useState<Row[]>([]),[error,fail]=useState(''),[notice,say]=useState(''),[busy,work]=useState(false)
+ const [recipient,setRecipient]=useState('')
+ const reload=async()=>set(await api(base+'report-drafts'))
+ useEffect(()=>{reload().catch(e=>fail(e.message))},[pid])
+ async function act(fn:()=>Promise<string>){work(true);fail('');say('');try{const m=await fn();await reload();say(m)}catch(e){fail((e as Error).message)}finally{work(false)}}
+ return <fieldset className="control-group" disabled={busy||!canEdit}><ReportRule pid={pid} onRecipient={setRecipient}/><article><h2>Reporting drafts</h2><form onSubmit={e=>{e.preventDefault();const f=Object.fromEntries(new FormData(e.currentTarget));act(async()=>{await api(base+'report-drafts','POST',f);return 'Report prepared.'})}}><div className="pair"><label>From (UTC)<input type="date" required name="start"/></label><label>Through (UTC)<input type="date" required name="end"/></label></div><label>Audience<select name="audience"><option>CEO</option><option>Client</option></select></label><button className="primary">Generate report draft</button></form></article>{error&&<p role="alert">{error}</p>}{notice&&<p role="status">{notice}</p>}{rows.map(r=><article key={r.id+'-'+r.revision}><small>{r.audience} · revision {r.revision}</small><h2>{r.period_start} – {r.period_end}</h2><form onSubmit={e=>{e.preventDefault();const body=String(new FormData(e.currentTarget).get('body'));act(async()=>{await api(base+'report-drafts/'+r.id,'PUT',{body,revision:r.revision});return 'Report revision saved.'})}}><label>Report text<textarea name="body" className="plan" defaultValue={r.body} required/></label><button>Save edited draft</button></form><form onSubmit={e=>{e.preventDefault();const email=new FormData(e.currentTarget).get('email');act(async()=>{await api(base+'actions','POST',{kind:'Email report',title:r.audience+' project report · '+r.period_end,destination:email,reference:'',body:r.body});return 'Saved report revision queued. Review exact recipient and content under Agents → Automation.'})}}><label>Recipient for saved revision<input type="email" name="email" key={recipient} defaultValue={recipient} required/></label><button>Prepare saved revision for email approval</button></form></article>)}</fieldset>
+}

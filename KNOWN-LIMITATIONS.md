@@ -1,0 +1,15 @@
+# Release boundaries
+
+| Area | Current boundary | Acceptance or work remaining |
+|---|---|---|
+| Laptop stack | Docker, a PostgreSQL server and the FastAPI runtime were unavailable during this audit. | Run the disposable stack test, install on the laptop, sign in, verify source and key persistence after restart. Actual SQL, concurrency, permission boundaries and migrations still require execution. |
+| Browser | TypeScript, production compilation, client HTTP contracts and the offline adapter were exercised. | Perform desktop/mobile visual and keyboard checks in an actual browser. |
+| External integrations | Provider adapters and selected error paths have fixture coverage. | Independently verify a billable response for each required provider, Jira project/board and issue hierarchy, Slack channel and membership, external activity and email receipt. |
+| Knowledge | Lexical passage retrieval; DOCX, XLSX, text PDFs and UTF-8 text formats; other files can be stored as originals. | No OCR, semantic embedding index, separate object-storage service, malware scanner or granular requirement-change ledger. Large scopes need splitting. Treat retrieved text as untrusted. |
+| Scheduling | Working-day capacity and dependency calculation is separate from AI estimates. | Human review must account for absences, holidays, cross-project workload and task realism. Generated due dates require review. |
+| Service coverage | Jira Cloud site tokens and a Slack bot token; Resend email. | OAuth installation wizard, arbitrary Jira custom fields, additional mail providers, full historical sync, threads, Jira attachments/worklogs and webhook replay are outstanding. |
+| Reporting and monitoring | Reports use available snapshots, decision records, status mapping and due dates. One active schedule per project; email requires specific review. | Import coverage is bounded. Status alone cannot verify task acceptance. Concurrent daily CEO and weekly client schedules, unattended opt-in delivery, arbitrary templates, job backfill and permanent escalation need further work. |
+| Feedback | Category-based proposals, occurrence counts, evaluation notes, manual approval and latest-change rollback. | Outcome evaluation and quality comparisons against a labelled dataset need development. Earlier feedback lacks generated proposals. |
+| Data lifecycle | Project removal archives the workspace; originals and audit history remain. Dashboard counts cover accessible active records. | Permanent purge, retention policy, central employee directory, project defaults and tested backup restoration are open. |
+| Operations | Localhost deployment. Source-controlled schema upgrades are additive. Usage and cost are estimates using configured rates. | No hosted instance, CI deployment, forward/backward migration rehearsal, automatic backup schedule, read replica, provider invoice reconciliation or production certification. Ambiguous external writes require human reconciliation. |
+| Platform roadmap | Shared PM agent foundation only. | Sales, CEO, HR, Finance and Recruitment agents and cross-department event flows are subsequent phases. |
