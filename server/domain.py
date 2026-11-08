@@ -1,12 +1,9 @@
 """Pure project rules used by the API and by offline regression tests."""
-import base64
 import hashlib
 import hmac
 import math
 import re
 import secrets
-import struct
-import time
 from collections import Counter
 from datetime import date, timedelta
 
@@ -19,18 +16,6 @@ def password_hash(password, salt=None):
 
 def password_matches(password, stored):
     return hmac.compare_digest(password_hash(password, stored.split(".")[0]), stored)
-
-
-def otp_step(secret, code, now=None):
-    step = int(time.time() if now is None else now) // 30
-    key = base64.b32decode(secret.upper())
-    for counter in (step, step-1):
-        digest = hmac.digest(key, struct.pack(">Q", counter), "sha1")
-        offset = digest[-1] & 15
-        value = (int.from_bytes(digest[offset:offset+4], "big") & 0x7fffffff) % 1000000
-        if hmac.compare_digest(f"{value:06}", code):
-            return counter
-    return -1
 
 
 def chunks(text, size=1400):

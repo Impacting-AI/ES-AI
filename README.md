@@ -4,7 +4,7 @@
 
 ## First launch on a Mac
 
-Install and open Docker Desktop. Extract the source ZIP. In Terminal, open the extracted folder containing Start.command and run `bash Start.command`. Choose your admin login, register the displayed key in your authenticator and open **http://localhost:8080**. The launcher starts the database, backend, frontend and worker. See SETUP-GUIDE.md for the step-by-step walkthrough, restart instructions, manual setup and recovery.
+Install and open Docker Desktop. Extract the source ZIP. In Terminal, open the extracted folder containing Start.command and run `bash Start.command`. Choose your admin login and password and open **http://localhost:8080**. The launcher starts the database, backend, frontend and worker. See SETUP-GUIDE.md for the step-by-step walkthrough, restart instructions, manual setup and recovery.
 
 ## What you can do
 

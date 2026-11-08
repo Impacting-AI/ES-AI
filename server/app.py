@@ -19,13 +19,13 @@ from typing import Literal
 from pypdf import PdfReader
 
 from .body_limit import BodyLimit
-from .db import cipher, database
+from .db import database
 from .ingest import index_source
 from .knowledge import select_context,valid_citations,project_passages,historical_request,historical_context
 from .imports import parse_export
 from .review_rules import suggested_instruction
 from .transport import ServiceFailure
-from .domain import chunks, otp_step, password_matches, retrieve, working_schedule
+from .domain import chunks, password_matches, retrieve, working_schedule
 from .models import PROVIDERS, generate, POLICY
 from .agent_store import settings as agent_settings, save as save_policy, secret
 from .agent_policy import permitted,reserve_estimate,may_admin,may_edit
@@ -125,7 +125,6 @@ def throttle(key, limit, seconds):
 class Login(BaseModel):
     login: str = Field(max_length=254)
     password: str = Field(max_length=512)
-    code: str = Field(pattern=r"^[0-9]{6}$")
 
 
 @app.post("/api/login")
@@ -134,11 +133,9 @@ def login(data: Login, request: Request, response: Response):
     throttle("ip:"+request.client.host,30,900)
     throttle("login:"+hashlib.sha256(name.encode()).hexdigest(),10,900)
     with database() as db:
-        user = db.execute("SELECT * FROM users WHERE login=%s FOR UPDATE",(name,)).fetchone()
+        user = db.execute("SELECT id,password,agent_access FROM users WHERE login=%s FOR UPDATE",(name,)).fetchone()
         if not user or not password_matches(data.password,user["password"]): raise HTTPException(401,"Sign-in failed.")
-        step = otp_step(cipher().decrypt(user["otp_encrypted"].encode()).decode(),data.code)
-        if step <= user["last_step"]: raise HTTPException(401,"Sign-in failed.")
-        db.execute("UPDATE users SET last_step=%s WHERE id=%s",(step,user["id"]))
+        if not user["agent_access"]:raise HTTPException(403,"PM AI ES access is disabled for this account.")
         token = secrets.token_urlsafe(40)
         db.execute("INSERT INTO sessions VALUES (%s,%s,%s)",(hashlib.sha256(token.encode()).hexdigest(),user["id"],int(time.time())+28800))
         audit(db,user["id"],None,"login",name)

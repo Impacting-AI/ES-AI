@@ -1,6 +1,6 @@
 from datetime import date
 import unittest
-from server.domain import chunks, password_hash, password_matches, otp_step, retrieve, working_schedule
+from server.domain import chunks, password_hash, password_matches, retrieve, working_schedule
 
 
 def task(key,owner='QA',hours=8,deps=()):
@@ -12,12 +12,6 @@ class DomainTests(unittest.TestCase):
         result=password_hash('correct password')
         self.assertTrue(password_matches('correct password',result))
         self.assertFalse(password_matches('wrong password',result))
-
-    def test_totp_published_vector(self):
-        import base64
-        secret=base64.b32encode(b'12345678901234567890').decode()
-        self.assertEqual(otp_step(secret,'287082',59),1)
-        self.assertEqual(otp_step(secret,'111111',59),-1)
 
     def test_overlap(self):
         source='0123456789'*350

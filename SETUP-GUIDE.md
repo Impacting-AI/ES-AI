@@ -2,7 +2,7 @@
 
 ## Mac setup
 
-1. Install Docker Desktop for your Mac. Open it and wait until Docker is running. Also have an authenticator app available for the six-digit sign-in code. Internet is needed for the first build and for external services.
+1. Install Docker Desktop for your Mac. Open it and wait until Docker is running. Internet is needed for the first build and for external services.
 2. Download the source ZIP and double-click it in Finder. Find the folder containing **Start.command**, **compose.yaml** and **Dockerfile**. Keep this folder in one permanent location.
 3. Open Terminal. Type `cd ` with a space, drag that folder into Terminal and press Return. Then run:
 
@@ -11,8 +11,8 @@
    ```
 
 4. The launcher creates two private installation keys in `.env`, builds the web app, starts PostgreSQL and creates its tables. On first installation, enter your admin username or email and a password of at least 14 characters. Terminal hides the password while you type.
-5. The launcher displays a setup key. In your authenticator, add an account using a setup key and choose **time based**. Store the key privately. Wait for the launcher to say the application is ready.
-6. Open **http://localhost:8080**. Enter the same username and password, plus the current six-digit code. Docker runs the frontend, backend and report worker together.
+5. Wait for the launcher to say the application is ready.
+6. Open **http://localhost:8080**. Enter the same username and password. Docker runs the frontend, backend and report worker together.
 7. Open **Projects → Create project**. Enter a project and client name. Open it, upload a small text scope and approve it. In **AI PM chat**, turn **Response OFF** and save a note. Refresh, reopen the project and search the Documents screen for a word in the note.
 8. Open **Agents → AI model** to enable genuine AI responses. Follow CONFIGURATION-GUIDE.md for model, Jira, Slack and email settings. First test against an internal project and a recipient you control.
 
@@ -29,7 +29,7 @@ Run these commands in the same project folder.
 | Read recent errors | `docker compose logs --tail 50 app worker db` |
 | Test authentication, project isolation and database restart in a separate disposable database | `bash tests/check-stack.sh` |
 | Test configured accounts on a disposable installation | `docker compose exec app python -m tests.live_acceptance` |
-| Recover a login from the trusted laptop terminal | `docker compose run --rm app python -m server.admin` and enter the original username to reset its password and authenticator |
+| Recover a login from the trusted laptop terminal | `docker compose run --rm app python -m server.admin` and enter the original username to reset its password |
 | Add an employee login | `docker compose run --rm app python -m server.admin --role Employee` |
 
 The PostgreSQL data lives in a Docker volume. Keep the installation folder, Compose project name and original .env together. Removing volumes deletes data. The backend and frontend share port 8080. If it is occupied, close the other application using it and rerun the launcher.

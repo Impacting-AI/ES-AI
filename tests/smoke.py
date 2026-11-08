@@ -1,33 +1,34 @@
 """Run inside the built app container against a DISPOSABLE compose database."""
-import base64
-import hashlib
-import hmac
 import json
 import secrets
-import struct
 import time
 import uuid
 from pathlib import Path
 import httpx
-from server.db import database,cipher
+from server.db import database
 from server.domain import password_hash
 import os
 
 
 def run():
-    secret=secrets.token_bytes(20)
     login=str(uuid.uuid4())
     password=secrets.token_urlsafe(24)
     with database() as db:
         db.execute(Path('server/schema.sql').read_text())
-        db.execute('INSERT INTO users(id,login,password,otp_encrypted,platform_role) VALUES (%s,%s,%s,%s,%s)',(login,login,password_hash(password),cipher().encrypt(base64.b32encode(secret)).decode(),"Super Admin"))
+        db.execute('INSERT INTO users(id,login,password,platform_role) VALUES (%s,%s,%s,%s)',(login,login,password_hash(password),"Super Admin"))
     headers={'Origin':os.environ['PUBLIC_ORIGIN']}
     with httpx.Client(base_url='http://localhost:8080/api/',headers=headers) as c:
         assert c.get('projects').status_code==401
-        digest=hmac.digest(secret,struct.pack('>Q',int(time.time())//30),'sha1')
-        i=digest[-1]&15
-        code=f'{(int.from_bytes(digest[i:i+4],"big") & 0x7fffffff)%1000000:06}'
-        c.post('login',json=dict(login=login,password=password,code=code)).raise_for_status()
+        credentials=dict(login=login,password=password)
+        assert c.post('login',json=dict(login=login,password='incorrect')).status_code==401
+        assert c.get('session').status_code==401
+        c.post('login',json=credentials).raise_for_status()
+        for _ in range(2):
+            assert c.get('session').raise_for_status().json()['role']=='Super Admin'
+            c.get('projects').raise_for_status()
+        with database() as db:db.execute('UPDATE sessions SET expires=0 WHERE uid=%s',(login,))
+        assert c.get('projects').status_code==401
+        c.post('login',json=credentials).raise_for_status()
         pid=c.post('projects',json=dict(name='Smoke test',client='Fixture')).raise_for_status().json()['id']
         base=f'projects/{pid}/'
         def upload(name,body,family=''):

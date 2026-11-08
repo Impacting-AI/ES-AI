@@ -20,8 +20,7 @@ def run():
                 raise RuntimeError(f"{method} {path.split('?')[0]}: {detail}")
             return r.json()
         def login():
-            code=getpass.getpass("Current six-digit authenticator code (use a new code after logout): ")
-            request("POST","login",json={"login":user,"password":password,"code":code})
+            request("POST","login",json={"login":user,"password":password})
         request("GET","health");login()
         pid=request("POST","projects",json={"name":"Acceptance "+suffix,"client":"Internal fixture"})["id"]
         base="projects/"+pid+"/"
@@ -67,7 +66,7 @@ def run():
             print("PASS:",service,"generation and message retrieval" if service==d["policy"]["provider"] else "identity and resource discovery")
         request("POST","logout")
         assert client.get(base+"workspace").status_code==401
-        print("Sign in again using a fresh authenticator code.")
+        print("Sign in again with the same credentials.")
         login()
         assert any(p["id"]==pid for p in request("GET","projects"))
         assert request("GET",base+"sources/"+saved["id"])["description"]=="Custom fixture description"

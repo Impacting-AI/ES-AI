@@ -1,4 +1,5 @@
-CREATE TABLE IF NOT EXISTS users(id text PRIMARY KEY, login text UNIQUE NOT NULL, password text NOT NULL, otp_encrypted text NOT NULL, last_step bigint NOT NULL DEFAULT -1);
+CREATE TABLE IF NOT EXISTS users(id text PRIMARY KEY, login text UNIQUE NOT NULL, password text NOT NULL);
+ALTER TABLE users DROP COLUMN IF EXISTS otp_encrypted, DROP COLUMN IF EXISTS last_step;
 CREATE TABLE IF NOT EXISTS sessions(token text PRIMARY KEY, uid text NOT NULL REFERENCES users, expires bigint NOT NULL);
 CREATE TABLE IF NOT EXISTS attempts(bucket text PRIMARY KEY, began bigint NOT NULL, count integer NOT NULL);
 CREATE TABLE IF NOT EXISTS projects(id text PRIMARY KEY, name text NOT NULL, client text NOT NULL, created timestamptz DEFAULT now());
