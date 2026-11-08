@@ -5,6 +5,7 @@ from uuid import uuid4
 from fastapi import APIRouter,Depends,File,HTTPException,UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel,Field
+from .chat_errors import chat_error
 from .chat_memory import digest
 from .knowledge import process,select_context,valid_citations
 from .db import database
@@ -160,7 +161,7 @@ def router(member,ask,evidence,add_source):
                         db.execute("UPDATE chat_threads SET title=CASE WHEN title='New chat' THEN %s ELSE title END,summary=%s,updated=now(),revision=revision+1 WHERE id=%s",(data.body[:70],(digest(older[:-6] or older,current["summary"])),tid))
                         db.execute("INSERT INTO audit(uid,pid,action,subject) VALUES(%s,%s,'chat.answered',%s)",(user,pid,model))
                     send("done",model)
-                except Exception as e:send("error",e.detail if isinstance(e,HTTPException) else "Chat generation failed. Check the connection and retry.")
+                except Exception as e:send("error",e.detail if isinstance(e,HTTPException) else chat_error("generate",e))
                 finally:send("end","")
             task=asyncio.create_task(asyncio.to_thread(run))
             try:

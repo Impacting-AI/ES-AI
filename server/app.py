@@ -9,6 +9,10 @@ from pathlib import Path
 from urllib.parse import quote
 from uuid import uuid4
 
+from contextlib import asynccontextmanager
+from .migrate import migrate, VERSION
+from .chat_errors import chat_error
+
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
@@ -33,7 +37,13 @@ from .agent_api import router as agent_router
 from .activity import router as activity_router
 from .reporting import router as reporting_router
 
-app = FastAPI(title="PM AI ES", docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def lifespan(app):
+    migrate()
+    yield
+
+
+app = FastAPI(lifespan=lifespan,title="PM AI ES", docs_url=None, redoc_url=None)
 app.add_middleware(BodyLimit)
 PUBLIC = os.environ["PUBLIC_ORIGIN"].rstrip("/")
 META = "id,title,category,origin,description,state,original,family,version,created,processing,processing_error"
@@ -48,8 +58,8 @@ async def invalid_input(request, exc):
 def health():
     try:
         with database() as db:
-            row=db.execute("SELECT to_regclass('chat_files') AS schema_ready").fetchone()
-            if not row["schema_ready"]:raise ValueError()
+            row=db.execute("SELECT version FROM pm_schema_version WHERE id=1").fetchone()
+            if not row or row["version"] != VERSION:raise ValueError()
         return {"backend":"online","database":"ready"}
     except Exception:raise HTTPException(503,"Database unavailable or schema migration required.")
 
@@ -65,7 +75,13 @@ def audit(db, uid, pid, action, subject):
 async def boundary(request: Request, call_next):
     if request.method not in {"GET","HEAD","OPTIONS"} and request.headers.get("origin") != PUBLIC:
         return Response("Origin rejected",status_code=403)
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        route = getattr(request.scope.get("route"), "path", "")
+        if not route.startswith("/api/projects/{pid}/chats"):
+            raise
+        response = JSONResponse(status_code=500, content={"detail": chat_error(route, exc)})
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; object-src 'none'"
