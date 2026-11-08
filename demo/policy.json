@@ -9,6 +9,7 @@
   "provider": "OpenAI",
   "model": "",
   "instructions": "Use simple English. Cite approved scope and flag missing evidence.",
+  "response_preference":"Concise",
   "temperature": null,
   "jira_default": "",
   "jira_status_map": {},

@@ -38,14 +38,14 @@ export async function api(path:string,method='GET',body?:any):Promise<any>{
  if(op==='chats'){
   w.threads??=[]
   if(key==='context')return {eligible:w.sources.length,unready:0,approved_only:false}
-  if(!key&&method==='POST'){const t={id:id(),title:f.title,messages:[],revision:0};w.threads.unshift(t);return t}
-  if(!key)return w.threads.filter((t:Row)=>!t.archived&&t.title.toLowerCase().includes((new URLSearchParams(query).get('q')||'').toLowerCase()))
+  if(!key&&method==='POST'){const t={id:id(),title:f.title,created:now(),updated:now(),preview:'',messages:[],revision:0};w.threads.unshift(t);return t}
+  if(!key)return w.threads.filter((t:Row)=>!t.archived&&[t.title,...t.messages.map((m:Row)=>m.body)].join(' ').toLowerCase().includes((new URLSearchParams(query).get('q')||'').toLowerCase()))
   const t=w.threads.find((t:Row)=>t.id===key);if(!t)throw Error('Sample chat unavailable.')
   if(method==='PATCH')Object.assign(t,f)
   if(step==='turn'){
    if(f.respond)throw Error('Connect a model in the installed application to generate a reply.')
    await api('projects/'+pid+'/messages','POST',f)
-   t.messages.push({id:id(),role:'user',body:f.body,files:[],citations:[]});t.revision++;if(t.title==='New chat')t.title=f.body.slice(0,70)
+   t.messages.push({id:id(),role:'user',body:f.body,files:[],citations:[]});t.updated=now();t.preview=f.body.slice(0,160);t.revision++;if(t.title==='New chat')t.title=f.body.slice(0,70)
   }else if(step)throw Error('This action needs the installed application.')
   return structuredClone(t)
  }
@@ -63,6 +63,21 @@ export async function api(path:string,method='GET',body?:any):Promise<any>{
  if(op==='plans'&&key&&!step){Object.assign(w.plans.find((v:Row)=>v.id===key),{content:f.content,state:f.decision});return {}}
  if(op==='report-rule'){if(method==='PUT')w.rule=f;return {...w.rule}}
  if(op==='report-drafts'){if(method==='GET')return w.reports.slice();if(key){const r=w.reports.find((x:Row)=>x.id===key);r.body=f.body;r.revision++}else w.reports.push({id:id(),period_start:f.start,period_end:f.end,audience:f.audience,body:'Sample report · No external activity imported.',revision:1});return {}}
+ if(op==='conversation-feedback'){
+  w.conversationFeedback??=[]
+  if(!key&&method==='GET')return structuredClone(w.conversationFeedback)
+  if(!key){
+   const thread=w.threads?.find((t:Row)=>t.id===f.thread_id)
+   const selected=thread?.messages.filter((m:Row)=>f.entire||f.message_ids.includes(m.id))
+   if(!selected?.length)throw Error('Select messages from a saved conversation.')
+   const item={id:id(),pid,thread_id:f.thread_id,message_ids:selected.map((m:Row)=>m.id),category:f.category,correction:f.body,policy_text:f.body,edit_version:1,status:'draft',applied:{}}
+   w.conversationFeedback.unshift(item);return {id:item.id}
+  }
+  const item=w.conversationFeedback.find((r:Row)=>r.id===key)
+  if(!item)throw Error('Feedback unavailable.')
+  if(step==='evidence')return {messages:w.threads.find((t:Row)=>t.id===item.thread_id).messages.filter((m:Row)=>item.message_ids.includes(m.id)),versions:[{version:1,status:'draft',body:item.correction}]}
+  throw Error('Analysis and approval require the installed application.')
+ }
  if(op==='feedback'){w.reviews.push({id:id(),category:f.category,correction:f.body,evidence:['sample',f.target],policy_text:'Cross-check the answer against approved project sources.',status:'draft'});return {}}
  if(op==='improvements'){if(key){const r=w.reviews.find((x:Row)=>x.id===key);Object.assign(r,{status:f.approve?'approved':'rejected',evaluation:f.evaluation})}return w.reviews.slice()}
  if(op==='actions'){if(method==='GET')return w.actions.slice();if(!key)w.actions.push({id:id(),revision:1,status:'draft',target:'Offline demo',payload:f});else if(step==='reject')w.actions.find((x:Row)=>x.id===key).status='rejected';else throw Error('External publication requires the local application.');return {}}

@@ -33,3 +33,16 @@ assert.equal(mic.active,true);mic.onresult({results:[[{transcript:'Review scope'
 mic.onerror({error:'not-allowed'});assert.match(failure,/denied/)
 assert.throws(()=>startDictation(null,'en',()=>{},()=>{},()=>{}),/does not support/)
 console.log('PASS: speech adapter transcript, permission-denied and unsupported-browser fixtures.')
+const controls=await build({entryPoints:['web/ComposerControls.tsx'],bundle:true,external:['react','react/jsx-runtime'],format:'cjs',platform:'node',write:false})
+const controlsModule={exports:{}}
+new Function('require','module','exports',controls.outputFiles[0].text)(req,controlsModule,controlsModule.exports)
+for(const active of [true,false]){
+ const actions=[]
+ const node=controlsModule.exports.default({busy:false,mic:active,on:active,attach:()=>actions.push('attach'),dictate:()=>actions.push('mic'),toggle:()=>actions.push('mode')})
+ for(const button of node.props.children){assert.equal(button.props.title,button.props['aria-label']);button.props.onClick()}
+ const markup=renderToStaticMarkup(node)
+ assert.equal(markup.split('<svg').length-1,3)
+ assert(markup.includes('aria-checked="'+active+'"'));assert(markup.includes('aria-pressed="'+active+'"'))
+ assert.deepEqual(actions,['attach','mic','mode'])
+}
+console.log('PASS: composer icons, accessible names, switch state and action handlers.')

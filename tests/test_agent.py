@@ -3,6 +3,7 @@ from unittest.mock import patch
 import json
 from pydantic import ValidationError
 from server.agent_policy import Policy,choose_tool,permitted,health_snapshot,reserve_estimate
+from server.response_style import chat_style,PREFERENCES
 from server.models import generate
 from server.connectors import ExternalAction,publish
 from server.transport import Result
@@ -53,10 +54,13 @@ class AgentTests(unittest.TestCase):
         post=client.return_value.__enter__.return_value.post
         for provider,reply in replies.items():
             post.return_value=Result(200,json.dumps(reply).encode())
-            self.assertEqual(generate({'provider':provider,'model':'test'},'Question',[],secret='fixture',max_tokens=512,instructions='Be brief'),('example',2,3))
-            payload=post.call_args.kwargs['json']
-            self.assertIn('512',str(payload))
-            self.assertIn('Be brief',str(payload))
+            self.assertEqual(Policy().response_preference,'Concise')
+            for preference in PREFERENCES:
+                style=chat_style(preference)
+                self.assertEqual(generate({'provider':provider,'model':'test'},'Question',[],secret='fixture',max_tokens=512,instructions=style),('example',2,3))
+                payload=str(post.call_args.kwargs['json'])
+                for expected in ('512',PREFERENCES[preference],'source citations','explicit request for detail'):
+                    self.assertIn(expected,payload)
 
     @patch('server.connectors.Client')
     def test_jira_issue_fields(self,client):

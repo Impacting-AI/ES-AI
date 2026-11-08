@@ -85,6 +85,23 @@ def run():
         p2=c.post("projects",json={"name":"Other project","client":"QA"}).raise_for_status().json()["id"]
         assert c.get("projects/"+p2+"/chats/"+thread["id"]).status_code==404
         assert c.get("projects/"+p2+"/search",params={"q":marker}).raise_for_status().json()==[]
+        review=base+"conversation-feedback"
+        correction=dict(thread_id=thread["id"],message_ids=[messages[0]["id"]],category="Response style",body="Lead with the deadline.")
+        assert c.post("projects/"+p2+"/conversation-feedback",json=correction).status_code==404
+        assert c.post(review,json={**correction,"message_ids":["unrelated"]}).status_code==422
+        key=c.post(review,json=correction).raise_for_status().json()["id"]
+        item=next(r for r in c.get(review).raise_for_status().json() if r["id"]==key)
+        assert item["thread_id"]==thread["id"] and item["message_ids"]==correction["message_ids"]
+        assert c.get(review+"/"+key+"/evidence").raise_for_status().json()["messages"][0]["body"]==messages[0]["body"]
+        decision=dict(text="Lead with the deadline when known.",version=item["edit_version"],action="save")
+        route=review+"/"+key+"/decision"
+        c.post(route,json=decision).raise_for_status()
+        assert c.post(route,json=decision).status_code==409
+        decision.update(version=decision["version"]+1,action="approve")
+        assert c.post(route,json=decision).raise_for_status().json()["applied"]["scope"]=="project"
+        decision.update(version=decision["version"]+1,action="rollback")
+        assert c.post(route,json=decision).raise_for_status().json()["status"]=="rolled back"
+        assert len(c.get(review+"/"+key+"/evidence").raise_for_status().json()["versions"])==4
         failed=c.post(base+"files",data={"title":"Unreadable","category":"Scope","origin":"QA"},files={"file":("bad.docx",b"damaged")}).raise_for_status().json()
         assert failed["processing"]=="Failed"
         assert c.post(base+"sources/"+failed["id"]+"/retry").raise_for_status().json()["error"]

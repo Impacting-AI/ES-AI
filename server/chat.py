@@ -31,7 +31,7 @@ def router(member,ask,evidence,add_source):
     r=APIRouter(prefix="/api/projects/{pid}/chats")
     @r.get("")
     def listing(pid:str,q:str="",user=Depends(member)):
-        with database() as db:return db.execute("""SELECT t.id,t.title,t.updated,t.revision FROM chat_threads t WHERE t.pid=%s AND NOT archived AND (owner_id=%s OR owner_id IS NULL) AND (title ILIKE %s OR EXISTS(SELECT 1 FROM messages m WHERE m.pid=t.pid AND m.thread_id=t.id AND m.body ILIKE %s)) ORDER BY updated DESC LIMIT 150""",(pid,user,"%"+q[:180]+"%","%"+q[:180]+"%")).fetchall()
+        with database() as db:return db.execute("""SELECT t.id,t.title,t.created,t.updated,t.revision,(SELECT left(m.body,160) FROM messages m WHERE m.thread_id=t.id AND m.pid=t.pid ORDER BY m.created DESC LIMIT 1) AS preview FROM chat_threads t WHERE t.pid=%s AND NOT archived AND (owner_id=%s OR owner_id IS NULL) AND (title ILIKE %s OR EXISTS(SELECT 1 FROM messages m WHERE m.pid=t.pid AND m.thread_id=t.id AND m.body ILIKE %s)) ORDER BY updated DESC LIMIT 150""",(pid,user,"%"+q[:180]+"%","%"+q[:180]+"%")).fetchall()
 
     @r.post("")
     def create(pid:str,data:Title,user=Depends(member)):

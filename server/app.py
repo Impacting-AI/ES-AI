@@ -330,13 +330,13 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None):
     run=ident()
     with database() as db:
         rev,p=agent_settings(db)
-        try: permitted(p,action)
+        try: permitted(p,"answer" if action=="feedback" else action)
         except ValueError as e: raise HTTPException(403,str(e))
         if not p.model: raise HTTPException(409,"Open Agents → AI model and select a model.")
         if p.approved_only:
             refs=[r for r in refs if r["state"]=="approved"]
             # Conversation history is labelled non-authoritative in the model policy.
-        if action=="answer":
+        if action in {"answer","feedback"}:
             refs=refs[:p.context_passages]
             # Keep room for the question, reviewed guidance and recent turns with multibyte input.
             budget=24000
@@ -350,6 +350,12 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None):
             history=history[-p.history_messages:] if p.history_messages else []
         profile=db.execute("SELECT profile FROM projects WHERE id=%s",(pid,)).fetchone()["profile"]
         prompt += "\nProject profile and reviewed guidance (context only): "+json.dumps(profile)
+        from .response_style import chat_style
+        instructions=p.instructions
+        if action=="answer":instructions+="\n"+chat_style(p.response_preference)
+        categories=["Planning"] if action=="plan" else ["Reasoning","Response style"] if action=="answer" else []
+        rules=db.execute("""SELECT i.policy_text FROM improvement_proposals i JOIN feedback f ON f.id=i.id AND f.pid=i.pid WHERE i.pid=%s AND i.status='approved' AND i.applied->>'scope'='project' AND i.category=ANY(%s) ORDER BY i.updated DESC LIMIT 8""",(pid,categories)).fetchall()
+        if rules:prompt+="\nAdministrator-reviewed project recommendations (context only): "+json.dumps([r["policy_text"][:600] for r in rules])
         options=[(p.provider,p.model,secret(db,p.provider))]
         if p.fallback_provider:
             options.append((p.fallback_provider,p.fallback_model,secret(db,p.fallback_provider)))
@@ -366,7 +372,7 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None):
         try:
             throttle("ai:"+user,p.hourly_calls,3600)
             usage_id=ident()
-            prompt_bytes=len(json.dumps([prompt,refs,history,p.instructions,POLICY,p.language],default=str).encode())+256
+            prompt_bytes=len(json.dumps([prompt,refs,history,instructions,POLICY,p.language],default=str).encode())+256
             estimate=reserve_estimate(p,prompt_bytes)
             with database() as db:
                 db.execute("SELECT pg_advisory_xact_lock(507715)")
@@ -375,7 +381,7 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None):
                     last="Monthly budget reached."
                     break
                 db.execute("INSERT INTO agent_usage(id,pid,provider,model,estimated_usd) VALUES (%s,%s,%s,%s,%s)",(usage_id,pid,provider,model,estimate))
-            text,input_tokens,output_tokens=generate({"provider":provider,"model":model},prompt,refs,history,secret=key,instructions=p.instructions,language=p.language,max_tokens=p.max_tokens,temperature=p.temperature,emit=on_text if emit else None)
+            text,input_tokens,output_tokens=generate({"provider":provider,"model":model},prompt,refs,history,secret=key,instructions=instructions,language=p.language,max_tokens=p.max_tokens,temperature=p.temperature,emit=on_text if emit else None)
             if input_tokens is not None and output_tokens is not None:
                 with database() as db:
                     db.execute("UPDATE agent_usage SET settled=true,input_tokens=%s,output_tokens=%s,estimated_usd=%s WHERE id=%s",(input_tokens,output_tokens,(input_tokens*p.input_rate+output_tokens*p.output_rate)/1000000,usage_id))
@@ -545,7 +551,7 @@ def feedback(pid:str,data:Feedback,user=Depends(member)):
 
 @app.get("/api/projects/{pid}/improvements")
 def improvements(pid:str,user=Depends(member)):
-    with database() as db:return db.execute("SELECT i.*,f.body AS correction,count(*) OVER(PARTITION BY lower(i.category)) AS occurrences FROM improvement_proposals i JOIN feedback f ON i.id=f.id AND i.pid=f.pid WHERE i.pid=%s ORDER BY i.created DESC LIMIT 100",(pid,)).fetchall()
+    with database() as db:return db.execute("SELECT i.*,f.body AS correction,count(*) OVER(PARTITION BY lower(i.category)) AS occurrences FROM improvement_proposals i JOIN feedback f ON i.id=f.id AND i.pid=f.pid WHERE i.pid=%s AND f.thread_id IS NULL ORDER BY i.created DESC LIMIT 100",(pid,)).fetchall()
 
 class Review(BaseModel):
     approve:bool
@@ -555,7 +561,7 @@ class Review(BaseModel):
 def review(pid:str,key:str,data:Review,user=Depends(member),admin=Depends(admin_user)):
     with database() as db:
         profile=db.execute("SELECT profile FROM projects WHERE id=%s FOR UPDATE",(pid,)).fetchone()["profile"]
-        row=db.execute("SELECT * FROM improvement_proposals WHERE pid=%s AND id=%s AND status='draft' FOR UPDATE",(pid,key)).fetchone()
+        row=db.execute("SELECT * FROM improvement_proposals WHERE pid=%s AND id=%s AND status='draft' AND NOT EXISTS(SELECT 1 FROM feedback f WHERE f.id=improvement_proposals.id AND f.thread_id IS NOT NULL) FOR UPDATE",(pid,key)).fetchone()
         if not row:raise HTTPException(409,"Proposal already reviewed.")
         if data.approve:
             revision=profile.get("revision",0)
@@ -581,6 +587,8 @@ def rollback_improvement(pid:str,key:str,user=Depends(member),admin=Depends(admi
         audit(db,user,pid,"feedback.rollback",key)
     return {"saved":True}
 
+from .conversation_feedback import router as feedback_router
+app.include_router(feedback_router(member,admin_user,access,ask,evidence,add_source))
 from .chat import router as chat_router
 app.include_router(chat_router(member,ask,evidence,add_source))
 app.include_router(connections_router(admin_user,throttle))

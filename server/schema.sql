@@ -76,3 +76,14 @@ ALTER TABLE chat_files ADD COLUMN IF NOT EXISTS original bytea;
 
 
 CREATE INDEX IF NOT EXISTS message_terms ON messages USING gin(to_tsvector('simple',body));
+
+ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS created timestamptz;
+UPDATE chat_threads t SET created=coalesce((SELECT min(created) FROM messages WHERE thread_id=t.id AND pid=t.pid),t.updated) WHERE created IS NULL;
+ALTER TABLE chat_threads ALTER COLUMN created SET DEFAULT now();
+ALTER TABLE feedback ADD COLUMN IF NOT EXISTS thread_id text REFERENCES chat_threads(id);
+ALTER TABLE feedback ADD COLUMN IF NOT EXISTS message_ids jsonb NOT NULL DEFAULT '[]';
+ALTER TABLE improvement_proposals ADD COLUMN IF NOT EXISTS analysis text NOT NULL DEFAULT '';
+ALTER TABLE improvement_proposals ADD COLUMN IF NOT EXISTS applied jsonb NOT NULL DEFAULT '{}';
+ALTER TABLE improvement_proposals ADD COLUMN IF NOT EXISTS edit_version integer NOT NULL DEFAULT 1;
+ALTER TABLE improvement_proposals ADD COLUMN IF NOT EXISTS updated timestamptz NOT NULL DEFAULT now();
+CREATE TABLE IF NOT EXISTS feedback_versions(proposal_id text REFERENCES improvement_proposals(id),version integer,body text NOT NULL,analysis text NOT NULL,status text NOT NULL,applied jsonb NOT NULL,actor text REFERENCES users,recorded timestamptz DEFAULT now(),PRIMARY KEY(proposal_id,version));

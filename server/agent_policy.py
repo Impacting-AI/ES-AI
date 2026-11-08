@@ -17,6 +17,7 @@ class Policy(BaseModel):
     provider: Provider = "OpenAI"
     model: str = Field(default="",pattern=r"^[A-Za-z0-9._:-]{0,120}$")
     instructions: str = Field(default="Use simple English. Cite approved scope and flag missing evidence.",max_length=4000)
+    response_preference:Literal["Concise","Balanced","Detailed"]="Concise"
     temperature: float | None = Field(default=None,ge=0,le=1,allow_inf_nan=False)
     jira_default: str = Field(default="",pattern=r"^$|^[A-Z][A-Z0-9]{1,19}$")
     jira_status_map: dict[str,Literal["Remaining","In progress","Review","Done","Blocked"]] = Field(default_factory=dict,max_length=100)
