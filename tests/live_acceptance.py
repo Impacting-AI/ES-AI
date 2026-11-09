@@ -68,6 +68,13 @@ def run():
                 assert marker not in simple["body"] and "cobalt" not in simple["body"].lower()
                 missing=send("What is the approved project budget?",4)
                 assert not any(c.isdigit() for c in missing["body"].split("[")[0])
+                if os.getenv("PM_EXTENDED_CHAT_TEST")=="1":
+                    for turn in range(20):
+                        response=send("Which handover identifier is in our approved scope?",5+turn)
+                        assert marker in response["body"],"Missing project identifier at turn "+str(turn+6)
+                    restored=request("GET",path)
+                    assert restored["revision"]==25 and len(restored["messages"])==50
+                    print("PASS: 25 committed turns and restored conversation history.")
                 print("Review actual responses for tone and grounding:")
                 for turn in (greeting,simple,missing):print(turn["body"])
                 print("PASS: unique identifier, saved citation, streaming and contextual follow-up.")

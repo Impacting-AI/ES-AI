@@ -61,3 +61,9 @@ Save the generated encryption key privately and reuse it for every subsequent la
 ## Back up and recover
 
 In the project directory run `docker compose exec -T db pg_dump -U pm -Fc pm > pm-backup.dump`. Store that file and a protected copy of the matching .env separately from the laptop. Both the dump and key are sensitive. For a recovery drill use a separate installation with matching encryption key and an empty database. Start only its database, then run `docker compose exec -T db pg_restore -U pm -d pm --exit-on-error < pm-backup.dump`. Run the migration, start app and worker and verify a login and a test document. Restore has not been executed in this audit.
+
+### Troubleshoot an interrupted chat
+
+After deploying the updated branch, open **Agents → PM AI ES → Monitoring → Request diagnostics**. Match the failed run to its time and chat. A route run selects relevant sources and an answer run generates the reply. Both consume the configured model-call allowance. Inspect the attempt, error, elapsed time, tokens, estimated cost and provider request ID. A blank token count means the provider did not report usage. Unknown charges remain reserved.
+
+For a configured-provider acceptance run on a disposable installation, run `docker compose exec -e PM_EXTENDED_CHAT_TEST=1 app python -m tests.live_acceptance`. This creates test data and makes billable calls. Allow sufficient hourly calls and budget for 25 turns plus their routing calls. The script verifies an uploaded unique identifier, checks citations, reloads saved messages, and prints responses for tone review.

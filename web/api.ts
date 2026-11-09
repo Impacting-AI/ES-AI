@@ -16,7 +16,7 @@ export async function chatTurn(path:string,data:Record<string,unknown>,signal:Ab
  if(!data.respond)return res.json()
  if(!res.body)throw Error('Streaming unavailable in this browser.')
  const reader=res.body.getReader(),decoder=new TextDecoder()
- let buffer='',done=false
+ let buffer='',done=false,completion:any=null
  try{
   for(;;){
    const next=await reader.read()
@@ -27,10 +27,11 @@ export async function chatTurn(path:string,data:Record<string,unknown>,signal:Ab
     const event=JSON.parse(line)
     if(event.type==='delta')onDelta(event.value)
     if(event.type==='error')throw Error(event.value)
-    if(event.type==='done')done=true
+    if(event.type==='done'){done=true;completion=event.value}
    }
    if(next.done)break
   }
  }finally{reader.releaseLock()}
  if(!done)throw Error('Stream interrupted. Your draft is available to retry.')
+ return completion
 }

@@ -50,6 +50,7 @@ def router(uid,admin_user,access,member,answer,plan,ask):
             digests=db.execute("SELECT d.* FROM agent_digests d JOIN members m ON m.pid=d.pid WHERE m.uid=%s ORDER BY created DESC LIMIT 30",(user,)).fetchall()
             usage=db.execute("""SELECT coalesce(sum(u.input_tokens),0) AS input,coalesce(sum(u.output_tokens),0) AS output,coalesce(sum(u.estimated_usd),0) AS usd,count(*) FILTER (WHERE NOT settled) AS pending FROM agent_usage u JOIN members m ON m.pid=u.pid AND m.uid=%s WHERE created>=date_trunc('month',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'""",(user,)).fetchone()
             if not may_admin(role):
+                for row in runs:row.pop("diagnostics",None)
                 return dict(admin=False,can_run=may_edit(role),usage={},revision=revision,policy={k:v for k,v in p.model_dump().items() if k in {"name","department","description","enabled","mode","provider","model","daily_digest","digest_frequency","approved_only"}},credentials={},runs=runs,versions=[],digests=digests)
             accounts=db.execute("SELECT id,login,platform_role,agent_access FROM users ORDER BY login").fetchall()
             return dict(connections=latest(db,p),admin=True,can_run=True,accounts=[a for a in accounts if a["id"]!=user],usage=usage,revision=revision,policy=p.model_dump(),credentials={s:bool(secret(db,s)) for s in SERVICES},runs=runs,versions=versions,digests=digests)

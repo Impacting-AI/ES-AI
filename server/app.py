@@ -1,5 +1,6 @@
 from .conversation import plan_turn, ROUTER
 import hashlib
+import math
 import io
 import json
 import os
@@ -29,7 +30,7 @@ from .ingest import index_source
 from .knowledge import select_context,valid_citations,project_passages,historical_request,historical_context
 from .imports import parse_export
 from .review_rules import suggested_instruction
-from .transport import ServiceFailure
+from .transport import ServiceFailure,retry_delay
 from .domain import chunks, password_matches, retrieve, working_schedule
 from .models import PROVIDERS, generate, POLICY
 from .agent_store import settings as agent_settings, save as save_policy, secret
@@ -343,8 +344,9 @@ def evidence(db,pid,question,chat=False,history=(),breadth=None,original=None):
     return refs
 
 
-def ask(user,pid,action,prompt,refs,history=(),emit=None,intent=None):
+def ask(user,pid,action,prompt,refs,history=(),emit=None,intent=None,tid=None,cancelled=None,question=None):
     run=ident()
+    question=question if question is not None else prompt
     with database() as db:
         rev,p=agent_settings(db)
         try: permitted(p,"answer" if action in {"feedback","route"} else action)
@@ -383,46 +385,96 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None,intent=None):
         if p.fallback_provider:
             options.append((p.fallback_provider,p.fallback_model,secret(db,p.fallback_provider)))
         db.execute("INSERT INTO agent_runs(id,pid,uid,action,status,revision) VALUES (%s,%s,%s,%s,'running',%s)",(run,pid,user,action,rev))
-    last="No model credential is configured."
-    result=None
-    started=False
+    raise_error = ""
+    attempts = []
+    result = None
+    status = 409
+    started = False
     def on_text(value):
         nonlocal started
-        started=True
+        started = True
         emit(value)
-    for provider,model,key in options:
-        if not key: continue
-        try:
-            throttle("ai:"+user,p.hourly_calls,3600)
-            usage_id=ident()
-            prompt_bytes=len(json.dumps([prompt,refs,history,instructions,POLICY,p.language],default=str).encode())+256
-            estimate=reserve_estimate(p,prompt_bytes)
-            with database() as db:
-                db.execute("SELECT pg_advisory_xact_lock(507715)")
-                spent=db.execute("SELECT coalesce(sum(estimated_usd),0) AS total FROM agent_usage WHERE created>=date_trunc('month',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'").fetchone()["total"]
-                if p.monthly_budget and float(spent)+estimate>p.monthly_budget:
-                    last="Monthly budget reached."
-                    break
-                db.execute("INSERT INTO agent_usage(id,pid,provider,model,estimated_usd) VALUES (%s,%s,%s,%s,%s)",(usage_id,pid,provider,model,estimate))
-            text,input_tokens,output_tokens=generate({"provider":provider,"model":model},prompt,refs,history,secret=key,instructions=instructions,language=p.language,max_tokens=min(p.max_tokens,512) if action=="route" else p.max_tokens,temperature=p.temperature,emit=on_text if emit else None)
-            if input_tokens is not None and output_tokens is not None:
+    for option_index,(provider, model, key) in enumerate(options):
+        if raise_error or result:
+            break
+        if not key:
+            raise_error = "Configure the selected provider credential in AI settings."
+            break
+        request_window=p.fallback_context_window if option_index else p.context_window
+        for index in range(2):
+            record = dict(provider=provider, model=model, attempt=index+1, status="failed")
+            attempts.append(record)
+            start = time.monotonic()
+            stage = "usage reservation"
+            try:
+                if cancelled and cancelled():
+                    raise ServiceFailure("Generation stopped.",499)
+                throttle("ai:"+user,p.hourly_calls,3600)
+                usage_id=ident()
+                prompt_bytes=len(json.dumps([prompt,refs,history,instructions,POLICY,p.language],default=str).encode())+256
+                output_limit=min(p.max_tokens,512) if action=="route" else p.max_tokens
+                estimate=reserve_estimate(p.model_copy(update={"max_tokens":output_limit}),prompt_bytes)
                 with database() as db:
-                    db.execute("UPDATE agent_usage SET settled=true,input_tokens=%s,output_tokens=%s,estimated_usd=%s WHERE id=%s",(input_tokens,output_tokens,(input_tokens*p.input_rate+output_tokens*p.output_rate)/1000000,usage_id))
-            if not text: raise ValueError()
-            result=(text,model,refs)
-            last=provider+" / "+model
-            break
-        except ServiceFailure as exc:
-            last=exc.category
-        except HTTPException:
-            last="Hourly request limit reached."
-            break
-        except Exception:
-            last=provider+" could not complete the model request."
-        if started:break
+                    db.execute("SELECT pg_advisory_xact_lock(507715)")
+                    spent=db.execute("SELECT coalesce(sum(estimated_usd),0) AS total FROM agent_usage WHERE created>=date_trunc('month',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'").fetchone()["total"]
+                    if p.monthly_budget and float(spent)+estimate>p.monthly_budget:
+                        raise ServiceFailure("Monthly agent budget reached. Review the budget in AI settings.",429)
+                    db.execute("INSERT INTO agent_usage(id,pid,provider,model,estimated_usd) VALUES (%s,%s,%s,%s,%s)",(usage_id,pid,provider,model,estimate))
+                record["estimated_usd"]=estimate
+                stage = "model response"
+                text,input_tokens,output_tokens=generate({"provider":provider,"model":model,"question":question,"context_window":request_window},prompt,refs,history,secret=key,instructions=instructions,language=p.language,max_tokens=output_limit,temperature=p.temperature,emit=on_text if emit else None,diagnostics=record)
+                if not text or not text.strip():
+                    raise ServiceFailure("Model returned no answer. Check its output limit and configuration.",422)
+                stage = "usage settlement"
+                if input_tokens is not None and output_tokens is not None:
+                    cost=(input_tokens*p.input_rate+output_tokens*p.output_rate)/1000000
+                    record.update(input_tokens=input_tokens,output_tokens=output_tokens,estimated_usd=cost)
+                    with database() as db:
+                        db.execute("UPDATE agent_usage SET settled=true,input_tokens=%s,output_tokens=%s,estimated_usd=%s WHERE id=%s",(input_tokens,output_tokens,cost,usage_id))
+                record["status"]="success"
+                used_ids=record.pop("used_ids",None)
+                result=(text,(provider+" / "+model) if option_index else model,[r for r in refs if used_ids is None or r.get("id") in used_ids])
+                break
+            except ServiceFailure as exc:
+                status=exc.code
+                record["error"]=exc.category
+                if not started and stage=="model response" and (exc.rejected or exc.category.startswith("Request exceeds the model input budget")):
+                    with database() as db:
+                        db.execute("UPDATE agent_usage SET settled=true,input_tokens=0,output_tokens=0,estimated_usd=0 WHERE id=%s",(usage_id,))
+                    record.update(input_tokens=0,output_tokens=0,estimated_usd=0)
+                if exc.request_id:record["request_id"]=exc.request_id
+                if status==413 and index==0 and not started and exc.category.startswith("Model context") and (refs or history):
+                    request_window=min(request_window or 8192,8192)
+                    refs=refs[:max(1,len(refs)//2)]
+                    history=history[-2:]
+                    continue
+                retry=exc.transient and not started and not (cancelled and cancelled())
+                delay=retry_delay(exc,index,started,cancelled and cancelled())
+                if delay is not None:
+                    time.sleep(delay)
+                    continue
+                raise_error=exc.category
+                if exc.retry_after:raise_error+=f". Retry after {math.ceil(min(exc.retry_after,86400))} seconds."
+                if retry and option_index+1<len(options) and not exc.retry_after:
+                    raise_error=""
+                break
+            except HTTPException as exc:
+                status=exc.status_code
+                raise_error="Hourly model-call limit reached. Retry after the hourly window resets." if status==429 else str(exc.detail)
+                record["error"]=raise_error
+                break
+            except Exception as exc:
+                status=502 if stage=="model response" else 503
+                record["error"]=stage+" / "+type(exc).__name__
+                raise_error=("The model returned an unreadable response." if stage=="model response" else "The request could not finish recording its usage.")+" Reference "+run+"."
+                break
+            finally:
+                record.pop("used_ids",None)
+                record["latency_ms"]=round((time.monotonic()-start)*1000)
+    detail=(attempts[-1]["provider"]+" / "+attempts[-1]["model"]) if result else raise_error
     with database() as db:
-        db.execute("UPDATE agent_runs SET status=%s,detail=%s,finished=now() WHERE id=%s",("success" if result else "failed",last,run))
-    if result is None: raise HTTPException(429 if last.startswith("Hourly") else 502,last)
+        db.execute("UPDATE agent_runs SET status=%s,detail=%s,finished=now(),diagnostics=%s::jsonb WHERE id=%s",("success" if result else "failed",detail,json.dumps({"conversation":tid,"attempts":attempts}),run))
+    if not result:raise HTTPException(status,raise_error)
     return result
 
 

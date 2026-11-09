@@ -26,7 +26,7 @@ export default function ProjectChat({pid,name,canEdit,openSource,onFeedback}:Pro
  useEffect(()=>{if(input.current){input.current.style.height='auto';input.current.style.height=Math.min(input.current.scrollHeight,170)+'px'}},[body])
  async function copy(v:string){await guard(async()=>{await navigator.clipboard.writeText(v);say('Copied.')})}
  async function submit(text=body,current=thread,attached=cached,forceOn=on,selectedFile=file){
-  if(busy||(!text.trim()&&!selectedFile))return
+  if(stream.current||busy||(!text.trim()&&!selectedFile))return
   const question=text.trim()||'Summarise this attachment and cite the source.'
   work(true);fail('');say('');delta('');setPending(question);follow.current=true
   const control=new AbortController();stream.current=control
@@ -41,7 +41,8 @@ export default function ProjectChat({pid,name,canEdit,openSource,onFeedback}:Pro
     cache(ids);pick(null)
    }
    if(control.signal.aborted)throw new DOMException('Stopped','AbortError')
-   await chatTurn(base+'/'+t!.id+'/turn',{body:question,revision:t!.revision,respond:forceOn,category,files:ids.map(f=>f.id),source_id:projectFile||undefined},control.signal,value=>delta(p=>p+value))
+   const completedModel=await chatTurn(base+'/'+t!.id+'/turn',{body:question,revision:t!.revision,respond:forceOn,category,files:ids.map(f=>f.id),source_id:projectFile||undefined},control.signal,value=>delta(p=>p+value))
+   if(forceOn&&completedModel?.fallback)say('Answered using the configured fallback: '+completedModel.model)
    if(!forceOn)say('Saved as draft project knowledge.')
    await open(t!.id);setList(await rows(query));write('');cache([])
   }catch(e){write(question);fail(control.signal.aborted?'Generation stopped. Edit or resend your message.':String((e as Error).message))}

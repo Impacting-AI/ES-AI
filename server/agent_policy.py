@@ -25,6 +25,8 @@ class Policy(BaseModel):
     sync_jira: bool = True
     sync_slack: bool = True
     slack_notifications: bool = False
+    context_window: int = Field(default=0,ge=0,le=4000000)
+    fallback_context_window: int = Field(default=0,ge=0,le=4000000)
     max_tokens: int = Field(default=2400,ge=128,le=8000)
     monthly_budget: float = Field(default=0,ge=0,le=100000,allow_inf_nan=False)
     input_rate: float = Field(default=0,ge=0,le=1000,allow_inf_nan=False)

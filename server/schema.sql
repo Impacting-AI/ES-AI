@@ -87,3 +87,7 @@ ALTER TABLE improvement_proposals ADD COLUMN IF NOT EXISTS applied jsonb NOT NUL
 ALTER TABLE improvement_proposals ADD COLUMN IF NOT EXISTS edit_version integer NOT NULL DEFAULT 1;
 ALTER TABLE improvement_proposals ADD COLUMN IF NOT EXISTS updated timestamptz NOT NULL DEFAULT now();
 CREATE TABLE IF NOT EXISTS feedback_versions(proposal_id text REFERENCES improvement_proposals(id),version integer,body text NOT NULL,analysis text NOT NULL,status text NOT NULL,applied jsonb NOT NULL,actor text REFERENCES users,recorded timestamptz DEFAULT now(),PRIMARY KEY(proposal_id,version));
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS diagnostics jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS generation_id text;
+ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS generation_until timestamptz;

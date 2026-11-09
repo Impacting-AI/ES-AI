@@ -1,6 +1,11 @@
 """JSON HTTP transport. Only type and status escape an unsuccessful provider call."""
 import base64
 import json
+import re
+import random
+import time
+from email.utils import parsedate_to_datetime
+from http.client import IncompleteRead
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, build_opener, HTTPRedirectHandler
@@ -11,18 +16,48 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 class ServiceFailure(Exception):
-    def __init__(self, category, code):
+    def __init__(self, category, code, *, transient=False):
         self.category, self.code = category, code
+        self.transient = transient
+        self.retry_after = 0.0
+        self.request_id = ""
+        self.rejected = False
         super().__init__(category)
 
 
-def failure(status, body=b""):
+def retry_delay(exc, index, emitted, cancelled):
+    """Return a bounded pre-output retry delay, or None when replay is unsafe."""
+    if index or emitted or cancelled or not exc.transient:
+        return None
+    delay=max(exc.retry_after,0.5*(2**index)+random.uniform(0,0.4))
+    return delay if delay<=4 else None
+
+
+def response_metadata(headers):
+    headers = {k.lower():v for k,v in (headers or {}).items()}
+    request_id = headers.get("x-request-id") or headers.get("request-id") or headers.get("x-goog-request-id","")
+    return request_id if re.fullmatch(r"[a-zA-Z0-9_.:-]{1,128}",request_id) else ""
+
+def failure(status, body=b"", headers=None):
+    exc = classify(status, body)
+    exc.rejected = status in (400,401,402,403,404,413,422,429)
+    exc.request_id = response_metadata(headers)
+    delay = (headers or {}).get("Retry-After","0")
+    try:exc.retry_after = max(0,float(delay))
+    except (ValueError,TypeError):
+        try:exc.retry_after = max(0,parsedate_to_datetime(delay).timestamp()-time.time())
+        except (ValueError,TypeError,OverflowError):pass
+    return exc
+
+def classify(status, body):
     try:
         payload=json.loads(body)
         e=payload.get("error",{})
         reason=str(e).lower()
     except (ValueError,AttributeError):reason=""
-    if any(s in reason for s in ("insufficient_quota","billing","credit balance","resource_exhausted","quota_exceeded")) or status==402:
+    if any(s in reason for s in ("context_length_exceeded","context window","too many input tokens","input is too long")):
+        return ServiceFailure("Model context limit reached. Shorten the message or lower the output limit.",413)
+    if any(s in reason for s in ("insufficient_quota","billing","credit balance","quota_exceeded")) or status==402:
         return ServiceFailure("Quota or billing limit reached",429)
     if status==401 or any(s in reason for s in ("api_key_invalid","invalid_auth","invalid_api_key","token_revoked","not_authed")):
         return ServiceFailure("Invalid credentials",401)
@@ -30,9 +65,10 @@ def failure(status, body=b""):
         return ServiceFailure("Insufficient permissions",403)
     if status==404 or any(s in reason for s in ("model_not_found","unknown_model")):
         return ServiceFailure("Requested model or resource unavailable",404)
-    if status==429:return ServiceFailure("Service rate limit reached",429)
+    if status==429 or "rate_limit_exceeded" in reason or "rate_limit_error" in reason:return ServiceFailure("Service rate limit reached",429,transient=True)
+    if status in (400,422) and "stream" in reason:return ServiceFailure("Unsupported stream parameters",422)
     if status in (400,422):return ServiceFailure("Service rejected the selected model parameters or request fields",422)
-    return ServiceFailure("Network or service error",502)
+    return ServiceFailure("Network or service error",502,transient=status in (408,500,502,503,504,529))
 
 
 class Result:
@@ -40,13 +76,14 @@ class Result:
         self.status_code,self.body,self.headers=status,body,headers or {}
 
     def raise_for_status(self):
-        if not 200<=self.status_code<300:raise failure(self.status_code,self.body)
+        if not 200<=self.status_code<300:raise failure(self.status_code,self.body,self.headers)
 
     def json(self):return json.loads(self.body)
 
 
 class Client:
     def __init__(self,timeout=30):
+        self.request_id=""
         self.timeout=timeout
         self.opener=build_opener(NoRedirect())
 
@@ -72,15 +109,19 @@ class Client:
         except HTTPError as error:
             try:return Result(error.code,error.read(32768),error.headers)
             finally:error.close()
-        except (URLError,TimeoutError,OSError) as exc:
-            raise ServiceFailure("Network or service error",502) from exc
+        except (URLError,TimeoutError,OSError,IncompleteRead) as exc:
+            raise ServiceFailure("Network or service error",502,transient=True) from exc
 
     def events(self,url,headers,payload):
         request=Request(url,data=json.dumps(payload).encode(),headers={**headers,"Content-Type":"application/json","Accept":"text/event-stream"},method="POST")
         try:
             with self.opener.open(request,timeout=self.timeout) as response:
+                self.request_id=response_metadata(response.headers)
                 total=0
+                deadline=time.monotonic()+120
                 for line in response:
+                    if time.monotonic()>deadline:
+                        raise ServiceFailure("Response timed out. Retry your message.",504,transient=True)
                     total+=len(line)
                     if total>8*1024**2:raise ServiceFailure("Stream size limit reached",502)
                     if line.startswith(b"data:"):
@@ -88,9 +129,9 @@ class Client:
                         if value==b"[DONE]":return
                         if value:yield json.loads(value)
         except HTTPError as e:
-            try:raise failure(e.code,e.read(32768))
+            try:raise failure(e.code,e.read(32768),e.headers)
             finally:e.close()
-        except (URLError,TimeoutError,OSError) as e:raise ServiceFailure("Stream disconnected",502) from e
+        except (URLError,TimeoutError,OSError,IncompleteRead) as e:raise ServiceFailure("Stream disconnected",502,transient=True) from e
 
     def post(self,url,*,headers=None,auth=None,json=None):
         return self.request("POST",url,headers=headers,auth=auth,payload=json)

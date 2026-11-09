@@ -9,6 +9,7 @@ def chat_style(preference):
             "Give simple questions one or two sentences. Give complex or explicitly detailed requests sufficient depth. "
             "Use prior turns to resolve references. Ask a short clarification if the referent is ambiguous. "
             "Answer general questions from reliable general knowledge. Never infer a project fact from general knowledge. "
+            "When asked for advice, base it on current approved constraints and identify recommendations and assumptions. Never present an estimate as a commitment. "
             "For hypothetical changes discuss effects only. Draft requested actions and identify required approval before publishing. "
             "Never imply an action occurred without confirmation. Omit unsolicited advice, offers and introductions. "
             "Lead with the answer. Use plain professional language in the requested language. "

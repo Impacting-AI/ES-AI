@@ -93,7 +93,7 @@ class ProviderHTTPTests(unittest.TestCase):
         finally:server.shutdown();server.server_close()
     def test_truncated_stream_is_failure(self):
         with patch.object(Client,'events',return_value=iter([{'choices':[{'delta':{'content':'partial'}}]}])):
-            with self.assertRaisesRegex(ValueError,'Incomplete'):generate(dict(provider='OpenAI',model='fixture'),'q',[],secret='test',emit=lambda _:None)
+            with self.assertRaisesRegex(ServiceFailure,'Incomplete'):generate(dict(provider='OpenAI',model='fixture'),'q',[],secret='test',emit=lambda _:None)
 
 class MemoryTests(unittest.TestCase):
     def test_long_memory_keeps_initial_and_recent(self):
@@ -115,6 +115,6 @@ class MemoryTests(unittest.TestCase):
 class BufferedFallbackTests(unittest.TestCase):
     def test_stream_parameter_refusal_retains_working_text_connection(self):
         from server.transport import Result
-        with patch.object(Client,'events',side_effect=ServiceFailure('Unsupported parameters',422)),patch.object(Client,'post',return_value=Result(200,b'{"choices":[{"message":{"content":"Buffered response"}}],"usage":{"prompt_tokens":1,"completion_tokens":2}}')):
+        with patch.object(Client,'events',side_effect=ServiceFailure('Unsupported stream parameters',422)),patch.object(Client,'post',return_value=Result(200,b'{"choices":[{"message":{"content":"Buffered response"}}],"usage":{"prompt_tokens":1,"completion_tokens":2}}')):
             pieces=[];answer=generate(dict(provider='OpenAI',model='fixture'),'hello',[],secret='sample',emit=pieces.append)
         self.assertEqual(answer,('Buffered response',1,2));self.assertEqual(pieces,['Buffered response'])

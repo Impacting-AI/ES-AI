@@ -25,10 +25,17 @@ class Intent:
     query: str
     sources: frozenset = frozenset()
 
-def plan_turn(ask, user, pid, message, history, selected=False):
+def plan_turn(ask, user, pid, message, history, selected=False, tid=None):
     if SOCIAL.fullmatch(message.strip()) and not selected:
         return Intent("social", "")
-    raw, _, _ = ask(user, pid, "route", message, [], history)
+    # Clear standalone requests need one model call. Mixed or anaphoric requests still use semantic routing.
+    phrase = message.strip().rstrip("?.!").casefold()
+    if not selected and re.fullmatch(r"(what is|explain|define) (jira|scrum|kanban|react hooks|python decorators|a sprint|a milestone)", phrase):
+        return Intent("general", message)
+    if not selected and re.fullmatch(r"(what is|when is|what's) (our|the project.s|the approved) (next milestone|approved budget|budget|deadline)", phrase):
+        return Intent("project", phrase, frozenset({"documents","profile"}))
+    route_args = {"tid":tid} if tid else {}
+    raw, _, _ = ask(user, pid, "route", message, [], history, **route_args)
     try:
         info = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip()))
         kind = info["kind"]

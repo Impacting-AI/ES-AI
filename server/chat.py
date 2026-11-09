@@ -6,6 +6,7 @@ from fastapi import APIRouter,Depends,File,HTTPException,UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel,Field
 from .conversation import plan_turn
+from .transport import ServiceFailure
 from .chat_errors import chat_error
 from .chat_memory import digest
 from .knowledge import process,select_context,valid_citations
@@ -120,66 +121,81 @@ def router(member,ask,evidence,add_source):
                 return {"saved":sid}
             recent=db.execute("SELECT role,body,refs FROM messages WHERE pid=%s AND thread_id=%s ORDER BY created DESC,id DESC LIMIT %s",(pid,tid,p.history_messages)).fetchall()[::-1]
             history=[dict(role=m['role'],body=m['body'][:1300]) for m in recent]
-        intent=plan_turn(ask,user,pid,data.body,history,selected=bool(files or data.source_id))
-        query=intent.query
-        overview=intent.kind=="overview"
-        with database() as db:
-            refs=evidence(db,pid,query,True,history,breadth=overview,original=data.body) if "documents" in intent.sources or (p.approved_only and "activity" in intent.sources) else []
-            pinned=[]
-            if data.source_id:
-                pinned=db.execute("""SELECT p.id,p.sid,p.position,p.body,p.location,s.title,s.state FROM passages p JOIN sources s ON s.id=p.sid AND s.pid=p.pid WHERE p.pid=%s AND s.id=%s AND s.processing='Ready' AND s.state<>'superseded' AND (NOT %s OR s.state='approved') ORDER BY p.position""",(pid,data.source_id,p.approved_only)).fetchall()
-                if not pinned:raise HTTPException(409,"The selected project file is unavailable under the current approval policy.")
-            recent_files=db.execute("""SELECT f.* FROM chat_files f WHERE f.pid=%s AND f.thread_id=%s AND EXISTS(SELECT 1 FROM messages m, jsonb_array_elements(m.files) a WHERE m.thread_id=f.thread_id AND m.pid=f.pid AND a->>'id'=f.id) ORDER BY f.created DESC LIMIT 4""",(pid,tid)).fetchall() if "files" in intent.sources and not p.approved_only else []
-            if not p.approved_only:
-                available={f['id']:f for f in recent_files}
-                available.update({f['id']:f for f in files})
-                extracts=[dict(id=f["id"]+'.'+str(i),sid=f['id'],title=f['name'],location=loc,body=text,state='draft',kind='attachment',position=i) for f in available.values() for i,(loc,text) in enumerate(f['parts'],1)]
-                if extracts:
-                    selected=select_context(extracts,query,history,min(4,p.context_passages),breadth=overview)
-                    if files and not selected:
-                        selected=[r for r in extracts if r["sid"] in data.files][:1]
-                    refs=(selected+refs if files else refs[:max(1,p.context_passages-2)]+selected)[:p.context_passages]
-            elif files:raise HTTPException(409,"Approved-only mode excludes conversation attachments. Add the file to project knowledge and approve it first.")
-            if "activity" in intent.sources and not p.approved_only:
-                hits = activity_context(db, pid, p, query)
-                refs = refs[:p.context_passages-len(hits)] + hits
-            if pinned:
-                chosen=select_context(pinned,query,history,max(1,p.context_passages//2),breadth=overview) or pinned[:1]
-                used={r['id'] for r in chosen}
-                refs=(chosen+[r for r in refs if r['id'] not in used])[:p.context_passages]
-            prompt=data.body
-            if "processing" in intent.sources:
-                status=db.execute("SELECT processing,state,count(*) AS count FROM sources WHERE pid=%s GROUP BY processing,state",(pid,)).fetchall()
-                prompt+="\nDocument processing counts (metadata): "+json.dumps(status,default=str)
-            if "memory" in intent.sources and not p.approved_only and p.history_messages:
-                past=db.execute("SELECT id,title,summary FROM chat_threads WHERE pid=%s AND owner_id=%s AND id<>%s AND NOT archived AND summary<>'' ORDER BY updated DESC LIMIT 40",(pid,user,tid)).fetchall()
-                from .domain import retrieve
-                memory=retrieve([dict(id=x['id'],state='draft',title=x['title'],body=x['summary']) for x in past],query,2)
-                prompt+="\nConversation memory (unverified): "+(t['summary']+ '\n'+'\n'.join(m['body'][:650] for m in memory))[:4800]
-                old=db.execute("""SELECT id,role,body FROM messages WHERE pid=%s AND thread_id=%s AND id NOT IN (SELECT id FROM messages WHERE pid=%s AND thread_id=%s ORDER BY created DESC,id DESC LIMIT %s) AND to_tsvector('simple',body) @@ plainto_tsquery('simple',%s) ORDER BY created DESC LIMIT 40""",(pid,tid,pid,tid,p.history_messages,query)).fetchall()
-                related=retrieve([dict(id=m['id'],title=m['role'],body=m['body'][:900],state='recorded') for m in old],query,2)
-                prompt+="\nEarlier matching conversation excerpts (unverified): "+json.dumps([r['body'] for r in related])
+            lease=str(uuid4())
+            locked=db.execute("""UPDATE chat_threads SET generation_id=%s,generation_until=now()+interval '12 minutes'
+                WHERE id=%s AND pid=%s AND revision=%s AND NOT archived
+                AND (generation_until IS NULL OR generation_until<=now()) RETURNING id""",
+                (lease,tid,pid,data.revision)).fetchone()
+            if not locked:raise HTTPException(409,"This conversation changed or already has a reply in progress. Reopen it before retrying.")
+        def release():
+            with database() as db:
+                db.execute("UPDATE chat_threads SET generation_id=NULL,generation_until=NULL WHERE id=%s AND generation_id=%s",(tid,lease))
+        try:
+            intent=plan_turn(ask,user,pid,data.body,history,selected=bool(files or data.source_id),tid=tid)
+            query=intent.query
+            overview=intent.kind=="overview"
+            with database() as db:
+                refs=evidence(db,pid,query,True,history,breadth=overview,original=data.body) if "documents" in intent.sources or (p.approved_only and "activity" in intent.sources) else []
+                pinned=[]
+                if data.source_id:
+                    pinned=db.execute("""SELECT p.id,p.sid,p.position,p.body,p.location,s.title,s.state FROM passages p JOIN sources s ON s.id=p.sid AND s.pid=p.pid WHERE p.pid=%s AND s.id=%s AND s.processing='Ready' AND s.state<>'superseded' AND (NOT %s OR s.state='approved') ORDER BY p.position""",(pid,data.source_id,p.approved_only)).fetchall()
+                    if not pinned:raise HTTPException(409,"The selected project file is unavailable under the current approval policy.")
+                recent_files=db.execute("""SELECT f.* FROM chat_files f WHERE f.pid=%s AND f.thread_id=%s AND EXISTS(SELECT 1 FROM messages m, jsonb_array_elements(m.files) a WHERE m.thread_id=f.thread_id AND m.pid=f.pid AND a->>'id'=f.id) ORDER BY f.created DESC LIMIT 4""",(pid,tid)).fetchall() if "files" in intent.sources and not p.approved_only else []
+                if not p.approved_only:
+                    available={f['id']:f for f in recent_files}
+                    available.update({f['id']:f for f in files})
+                    extracts=[dict(id=f["id"]+'.'+str(i),sid=f['id'],title=f['name'],location=loc,body=text,state='draft',kind='attachment',position=i) for f in available.values() for i,(loc,text) in enumerate(f['parts'],1)]
+                    if extracts:
+                        selected=select_context(extracts,query,history,min(4,p.context_passages),breadth=overview)
+                        if files and not selected:
+                            selected=[r for r in extracts if r["sid"] in data.files][:1]
+                        refs=(selected+refs if files else refs[:max(1,p.context_passages-2)]+selected)[:p.context_passages]
+                elif files:raise HTTPException(409,"Approved-only mode excludes conversation attachments. Add the file to project knowledge and approve it first.")
+                if "activity" in intent.sources and not p.approved_only:
+                    hits = activity_context(db, pid, p, query)
+                    refs = refs[:p.context_passages-len(hits)] + hits
+                if pinned:
+                    chosen=select_context(pinned,query,history,max(1,p.context_passages//2),breadth=overview) or pinned[:1]
+                    used={r['id'] for r in chosen}
+                    refs=(chosen+[r for r in refs if r['id'] not in used])[:p.context_passages]
+                prompt=data.body
+                if "processing" in intent.sources:
+                    status=db.execute("SELECT processing,state,count(*) AS count FROM sources WHERE pid=%s GROUP BY processing,state",(pid,)).fetchall()
+                    prompt+="\nDocument processing counts (metadata): "+json.dumps(status,default=str)
+                if "memory" in intent.sources and not p.approved_only and p.history_messages:
+                    past=db.execute("SELECT id,title,summary FROM chat_threads WHERE pid=%s AND owner_id=%s AND id<>%s AND NOT archived AND summary<>'' ORDER BY updated DESC LIMIT 40",(pid,user,tid)).fetchall()
+                    from .domain import retrieve
+                    memory=retrieve([dict(id=x['id'],state='draft',title=x['title'],body=x['summary']) for x in past],query,2)
+                    prompt+="\nConversation memory (unverified): "+(t['summary']+ '\n'+'\n'.join(m['body'][:650] for m in memory))[:4800]
+                    old=db.execute("""SELECT id,role,body FROM messages WHERE pid=%s AND thread_id=%s AND id NOT IN (SELECT id FROM messages WHERE pid=%s AND thread_id=%s ORDER BY created DESC,id DESC LIMIT %s) AND to_tsvector('simple',body) @@ plainto_tsquery('simple',%s) ORDER BY created DESC LIMIT 40""",(pid,tid,pid,tid,p.history_messages,query)).fetchall()
+                    related=retrieve([dict(id=m['id'],title=m['role'],body=m['body'][:900],state='recorded') for m in old],query,2)
+                    prompt+="\nEarlier matching conversation excerpts (unverified): "+json.dumps([r['body'] for r in related])
+        except Exception:
+            release()
+            raise
         async def events():
             loop=asyncio.get_running_loop();queue=asyncio.Queue();stopped=threading.Event()
             def send(kind,value):loop.call_soon_threadsafe(queue.put_nowait,dict(type=kind,value=value))
             def emit(value):
-                if stopped.is_set():raise RuntimeError("Stopped")
+                if stopped.is_set():raise ServiceFailure("Generation stopped.",499)
                 send("delta",value)
             def run():
                 try:
-                    answer,model,used=ask(user,pid,"answer",prompt,refs,history,emit=emit,intent=intent)
+                    answer,model,used=ask(user,pid,"answer",prompt,refs,history,emit=emit,intent=intent,tid=tid,cancelled=stopped.is_set,question=data.body)
                     if stopped.is_set():return
                     cites=valid_citations(answer,used)
                     with database() as db:
                         current=thread(db,pid,tid,user,True)
-                        if current['revision']!=data.revision or current['archived']:raise HTTPException(409,"Another turn changed this chat. Refresh and retry.")
+                        if current['revision']!=data.revision or current['archived'] or current['generation_id']!=lease or stopped.is_set():raise HTTPException(409,"Another turn changed this chat. Refresh and retry.")
                         save(db,'user',data.body,[],attachments);save(db,'assistant',answer,cites,[])
                         older=db.execute("SELECT role,body,refs FROM messages WHERE pid=%s AND thread_id=%s ORDER BY created DESC,id DESC LIMIT 30",(pid,tid)).fetchall()[::-1]
                         db.execute("UPDATE chat_threads SET title=CASE WHEN title='New chat' THEN %s ELSE title END,summary=%s,updated=now(),revision=revision+1 WHERE id=%s",(data.body[:70],(digest(older[:-6] or older,current["summary"])),tid))
                         db.execute("INSERT INTO audit(uid,pid,action,subject) VALUES(%s,%s,'chat.answered',%s)",(user,pid,model))
-                    send("done",model)
+                    send("done",dict(model=model,fallback=model!=p.model))
                 except Exception as e:send("error",e.detail if isinstance(e,HTTPException) else chat_error("generate",e))
-                finally:send("end","")
+                finally:
+                    try:release()
+                    finally:send("end","")
             task=asyncio.create_task(asyncio.to_thread(run))
             try:
                 yield '{"type":"start"}\n'

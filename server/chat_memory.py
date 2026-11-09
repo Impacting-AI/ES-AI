@@ -7,4 +7,6 @@ def digest(messages,previous=""):
         if entry not in entries:entries.append(entry)
     # Keep opening anchors, then the most recent distinct turns.
     anchors=entries[:3]
-    return "\n".join(anchors+[e for e in entries[-11:] if e not in anchors])[:4200]
+    important=[e for e in entries if any(term in e.lower() for term in ("approved","decided","blocked","unresolved","pending","decision"))][-4:]
+    ordered=list(dict.fromkeys(anchors+important+entries[-7:]))
+    return "\n".join(ordered)[:4200]
