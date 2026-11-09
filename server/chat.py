@@ -5,6 +5,7 @@ from uuid import uuid4
 from fastapi import APIRouter,Depends,File,HTTPException,UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel,Field
+from .conversation import plan_turn
 from .chat_errors import chat_error
 from .chat_memory import digest
 from .knowledge import process,select_context,valid_citations
@@ -27,6 +28,17 @@ def thread(db,pid,tid,uid,lock=False):
     t=db.execute("SELECT * FROM chat_threads WHERE pid=%s AND id=%s AND (owner_id=%s OR owner_id IS NULL)"+(" FOR UPDATE" if lock else ""),(pid,tid,uid)).fetchone()
     if not t:raise HTTPException(404,"Conversation unavailable.")
     return t
+
+def activity_context(db, pid, policy, query):
+    from .domain import retrieve
+    activity = db.execute("""SELECT e.service,e.remote_id,e.record,e.happened FROM delivery_events e JOIN project_links l ON l.pid=e.pid AND l.service=e.service WHERE e.pid=%s AND ((e.service='Jira' AND %s AND l.workspace=%s) OR (e.service='Slack' AND %s AND l.workspace=%s)) ORDER BY happened DESC LIMIT 80""",(pid,bool(policy.sync_jira and secret(db,'Jira')),policy.jira_site,bool(policy.sync_slack and secret(db,'Slack')),policy.slack_team)).fetchall()
+    records = [
+        dict(id=row['service']+'-'+row['remote_id'], title=row['service']+' activity',
+             state='recorded', kind='activity', body=json.dumps(row['record'], default=str),
+             happened=str(row['happened']))
+        for row in activity
+    ]
+    return retrieve(records, query, min(2, policy.context_passages))
 
 def router(member,ask,evidence,add_source):
     r=APIRouter(prefix="/api/projects/{pid}/chats")
@@ -91,7 +103,7 @@ def router(member,ask,evidence,add_source):
     @r.post("/{tid}/turn")
     def turn(pid:str,tid:str,data:Turn,user=Depends(member)):
         with database() as db:
-            t=thread(db,pid,tid,user,True)
+            t=thread(db,pid,tid,user,not data.respond)
             if t['archived'] or t['revision']!=data.revision:raise HTTPException(409,"Conversation changed. Reopen it before sending.")
             if not data.body.strip():raise HTTPException(422,"Write a message.")
             files=db.execute("SELECT * FROM chat_files WHERE pid=%s AND thread_id=%s AND id=ANY(%s::text[])",(pid,tid,data.files)).fetchall()
@@ -108,40 +120,45 @@ def router(member,ask,evidence,add_source):
                 return {"saved":sid}
             recent=db.execute("SELECT role,body,refs FROM messages WHERE pid=%s AND thread_id=%s ORDER BY created DESC,id DESC LIMIT %s",(pid,tid,p.history_messages)).fetchall()[::-1]
             history=[dict(role=m['role'],body=m['body'][:1300]) for m in recent]
-            refs=evidence(db,pid,data.body,True,history)
+        intent=plan_turn(ask,user,pid,data.body,history,selected=bool(files or data.source_id))
+        query=intent.query
+        overview=intent.kind=="overview"
+        with database() as db:
+            refs=evidence(db,pid,query,True,history,breadth=overview,original=data.body) if "documents" in intent.sources or (p.approved_only and "activity" in intent.sources) else []
             pinned=[]
             if data.source_id:
                 pinned=db.execute("""SELECT p.id,p.sid,p.position,p.body,p.location,s.title,s.state FROM passages p JOIN sources s ON s.id=p.sid AND s.pid=p.pid WHERE p.pid=%s AND s.id=%s AND s.processing='Ready' AND s.state<>'superseded' AND (NOT %s OR s.state='approved') ORDER BY p.position""",(pid,data.source_id,p.approved_only)).fetchall()
                 if not pinned:raise HTTPException(409,"The selected project file is unavailable under the current approval policy.")
-            recent_files=db.execute("""SELECT f.* FROM chat_files f WHERE f.pid=%s AND f.thread_id=%s AND EXISTS(SELECT 1 FROM messages m, jsonb_array_elements(m.files) a WHERE m.thread_id=f.thread_id AND m.pid=f.pid AND a->>'id'=f.id) ORDER BY f.created DESC LIMIT 4""",(pid,tid)).fetchall()
+            recent_files=db.execute("""SELECT f.* FROM chat_files f WHERE f.pid=%s AND f.thread_id=%s AND EXISTS(SELECT 1 FROM messages m, jsonb_array_elements(m.files) a WHERE m.thread_id=f.thread_id AND m.pid=f.pid AND a->>'id'=f.id) ORDER BY f.created DESC LIMIT 4""",(pid,tid)).fetchall() if "files" in intent.sources and not p.approved_only else []
             if not p.approved_only:
                 available={f['id']:f for f in recent_files}
                 available.update({f['id']:f for f in files})
                 extracts=[dict(id=f["id"]+'.'+str(i),sid=f['id'],title=f['name'],location=loc,body=text,state='draft',kind='attachment',position=i) for f in available.values() for i,(loc,text) in enumerate(f['parts'],1)]
                 if extracts:
-                    selected=select_context(extracts,data.body,history,min(4,p.context_passages))
+                    selected=select_context(extracts,query,history,min(4,p.context_passages),breadth=overview)
+                    if files and not selected:
+                        selected=[r for r in extracts if r["sid"] in data.files][:1]
                     refs=(selected+refs if files else refs[:max(1,p.context_passages-2)]+selected)[:p.context_passages]
-                activity=db.execute("""SELECT e.service,e.remote_id,e.record,e.happened FROM delivery_events e JOIN project_links l ON l.pid=e.pid AND l.service=e.service WHERE e.pid=%s AND ((e.service='Jira' AND %s AND l.workspace=%s) OR (e.service='Slack' AND %s AND l.workspace=%s)) ORDER BY happened DESC LIMIT 80""",(pid,bool(p.sync_jira and secret(db,'Jira')),p.jira_site,bool(p.sync_slack and secret(db,'Slack')),p.slack_team)).fetchall()
-                from .domain import retrieve
-                records=[dict(id=a['service']+'-'+a['remote_id'],title=a['service']+' activity',state='recorded',kind='activity',body=json.dumps(a['record'])) for a in activity]
-                hits=retrieve(records,data.body,min(2,max(0,p.context_passages-1)))
-                if hits:refs=refs[:p.context_passages-len(hits)]+hits
             elif files:raise HTTPException(409,"Approved-only mode excludes conversation attachments. Add the file to project knowledge and approve it first.")
+            if "activity" in intent.sources and not p.approved_only:
+                hits = activity_context(db, pid, p, query)
+                refs = refs[:p.context_passages-len(hits)] + hits
             if pinned:
-                chosen=select_context(pinned,data.body,history,max(1,p.context_passages//2))
+                chosen=select_context(pinned,query,history,max(1,p.context_passages//2),breadth=overview) or pinned[:1]
                 used={r['id'] for r in chosen}
                 refs=(chosen+[r for r in refs if r['id'] not in used])[:p.context_passages]
-            past=db.execute("SELECT id,title,summary FROM chat_threads WHERE pid=%s AND owner_id=%s AND id<>%s AND NOT archived AND summary<>'' ORDER BY updated DESC LIMIT 40",(pid,user,tid)).fetchall()
-            from .domain import retrieve
-            memory=retrieve([dict(id=x['id'],state='draft',title=x['title'],body=x['summary']) for x in past],data.body,2)
-            status=db.execute("SELECT processing,state,count(*) AS count FROM sources WHERE pid=%s GROUP BY processing,state",(pid,)).fetchall()
-            prompt=data.body+"\nDocument processing counts (metadata): "+json.dumps(status,default=str)
-            if not p.approved_only and p.history_messages:prompt+="\nConversation memory (unverified): "+(t['summary']+ '\n'+'\n'.join(m['body'][:650] for m in memory))[:4800]
-            if not p.approved_only and p.history_messages:
-                old=db.execute("""SELECT id,role,body FROM messages WHERE pid=%s AND thread_id=%s AND id NOT IN (SELECT id FROM messages WHERE pid=%s AND thread_id=%s ORDER BY created DESC,id DESC LIMIT %s) AND to_tsvector('simple',body) @@ plainto_tsquery('simple',%s) ORDER BY created DESC LIMIT 40""",(pid,tid,pid,tid,p.history_messages,data.body)).fetchall()
-                related=retrieve([dict(id=m['id'],title=m['role'],body=m['body'][:900],state='recorded') for m in old],data.body,2)
+            prompt=data.body
+            if "processing" in intent.sources:
+                status=db.execute("SELECT processing,state,count(*) AS count FROM sources WHERE pid=%s GROUP BY processing,state",(pid,)).fetchall()
+                prompt+="\nDocument processing counts (metadata): "+json.dumps(status,default=str)
+            if "memory" in intent.sources and not p.approved_only and p.history_messages:
+                past=db.execute("SELECT id,title,summary FROM chat_threads WHERE pid=%s AND owner_id=%s AND id<>%s AND NOT archived AND summary<>'' ORDER BY updated DESC LIMIT 40",(pid,user,tid)).fetchall()
+                from .domain import retrieve
+                memory=retrieve([dict(id=x['id'],state='draft',title=x['title'],body=x['summary']) for x in past],query,2)
+                prompt+="\nConversation memory (unverified): "+(t['summary']+ '\n'+'\n'.join(m['body'][:650] for m in memory))[:4800]
+                old=db.execute("""SELECT id,role,body FROM messages WHERE pid=%s AND thread_id=%s AND id NOT IN (SELECT id FROM messages WHERE pid=%s AND thread_id=%s ORDER BY created DESC,id DESC LIMIT %s) AND to_tsvector('simple',body) @@ plainto_tsquery('simple',%s) ORDER BY created DESC LIMIT 40""",(pid,tid,pid,tid,p.history_messages,query)).fetchall()
+                related=retrieve([dict(id=m['id'],title=m['role'],body=m['body'][:900],state='recorded') for m in old],query,2)
                 prompt+="\nEarlier matching conversation excerpts (unverified): "+json.dumps([r['body'] for r in related])
-            if not refs:prompt+="\nNo eligible project passage was retrieved. Explain the processing or approval status when relevant."
         async def events():
             loop=asyncio.get_running_loop();queue=asyncio.Queue();stopped=threading.Event()
             def send(kind,value):loop.call_soon_threadsafe(queue.put_nowait,dict(type=kind,value=value))
@@ -150,7 +167,7 @@ def router(member,ask,evidence,add_source):
                 send("delta",value)
             def run():
                 try:
-                    answer,model,used=ask(user,pid,"answer",prompt,refs,history,emit=emit)
+                    answer,model,used=ask(user,pid,"answer",prompt,refs,history,emit=emit,intent=intent)
                     if stopped.is_set():return
                     cites=valid_citations(answer,used)
                     with database() as db:

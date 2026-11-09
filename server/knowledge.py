@@ -62,12 +62,12 @@ def process(name,raw):
     except ValueError as e:return "Failed",str(e)[:250],[]
     except Exception as e:return "Failed","Document reader failed ("+type(e).__name__+").",[]
 
-def select_context(rows,question,history,limit):
+def select_context(rows,question,history,limit,*,breadth=None):
     eligible=[r for r in rows if r['state']!='superseded']
     enriched=[dict(r,title=" ".join(str(r.get(k) or "") for k in ("title","description","category","location"))) for r in eligible]
     originals={r["id"]:r for r in eligible}
     matches=[originals[r["id"]] for r in retrieve(enriched,question,len(enriched))]
-    if not matches and history:
+    if not matches and history and breadth is None:
         matches=retrieve(eligible,' '.join(m['body'] for m in history[-2:]),limit)
     # Round-robin representative passages prevent an empty overview or one long document monopolising it.
     groups=defaultdict(list)
@@ -75,6 +75,9 @@ def select_context(rows,question,history,limit):
         groups[row.get('sid',row['id'])].append(row)
     # An overview needs breadth, even when a shared category matches every passage.
     overview=bool(re.search(r"\b(summari[sz]e|overview|summar[yise]+|documents|milestones)\b",question,re.I))
+    if breadth is not None:
+        overview=breadth
+        if not overview:return matches[:limit]
     if overview:
         first={}
         for r in matches:first.setdefault(r.get("sid",r["id"]),r)

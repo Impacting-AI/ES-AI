@@ -1,3 +1,4 @@
+from .conversation import plan_turn, ROUTER
 import hashlib
 import io
 import json
@@ -329,24 +330,24 @@ class Message(BaseModel):
     category:str=Field(default="Project note",max_length=100)
 
 
-def evidence(db,pid,question,chat=False,history=()):
+def evidence(db,pid,question,chat=False,history=(),breadth=None,original=None):
     _,p=agent_settings(db)
     rows=project_passages(db,pid,p.approved_only)
     if not chat:return retrieve(rows,question,p.context_passages)
-    refs=select_context(rows,question,history,p.context_passages)
-    if not p.approved_only and historical_request(question):
-        past=historical_context(db,pid,question)
+    refs=select_context(rows,question,history,p.context_passages,breadth=breadth)
+    if not p.approved_only and historical_request(original or question):
+        past=historical_context(db,pid,original or question)
         if past:
             count=min(len(past),max(1,p.context_passages//3))
             refs=refs[:p.context_passages-count]+past[:count]
     return refs
 
 
-def ask(user,pid,action,prompt,refs,history=(),emit=None):
+def ask(user,pid,action,prompt,refs,history=(),emit=None,intent=None):
     run=ident()
     with database() as db:
         rev,p=agent_settings(db)
-        try: permitted(p,"answer" if action=="feedback" else action)
+        try: permitted(p,"answer" if action in {"feedback","route"} else action)
         except ValueError as e: raise HTTPException(403,str(e))
         if not p.model: raise HTTPException(409,"Open Agents → AI model and select a model.")
         if p.approved_only:
@@ -364,14 +365,20 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None):
                 budget-=len(encoded)
             refs=bounded
             history=history[-p.history_messages:] if p.history_messages else []
-        profile=db.execute("SELECT profile FROM projects WHERE id=%s",(pid,)).fetchone()["profile"]
-        prompt += "\nProject profile and reviewed guidance (context only): "+json.dumps(profile)
+        if action not in {"answer","route"} or (intent and "profile" in intent.sources):
+            profile=db.execute("SELECT profile FROM projects WHERE id=%s",(pid,)).fetchone()["profile"]
+            prompt += "\nProject profile and reviewed guidance (context only): "+json.dumps(profile)
         from .response_style import chat_style
         instructions=p.instructions
         if action=="answer":instructions+="\n"+chat_style(p.response_preference)
         categories=["Planning"] if action=="plan" else ["Reasoning","Response style"] if action=="answer" else []
-        rules=db.execute("""SELECT i.policy_text FROM improvement_proposals i JOIN feedback f ON f.id=i.id AND f.pid=i.pid WHERE i.pid=%s AND i.status='approved' AND i.applied->>'scope'='project' AND i.category=ANY(%s) ORDER BY i.updated DESC LIMIT 8""",(pid,categories)).fetchall()
+        if action=="route":instructions=ROUTER
+        if intent and not intent.sources:categories=[]
+        rules=db.execute("""SELECT i.policy_text FROM improvement_proposals i JOIN feedback f ON f.id=i.id AND f.pid=i.pid WHERE i.pid=%s AND i.status='approved' AND i.applied->>'scope'='project' AND i.category=ANY(%s) ORDER BY i.updated DESC LIMIT 8""",(pid,categories)).fetchall() if categories else []
         if rules:prompt+="\nAdministrator-reviewed project recommendations (context only): "+json.dumps([r["policy_text"][:600] for r in rules])
+        if intent and intent.kind in {"general","social"}:history=[]
+        if intent and intent.kind in {"project","overview"}:
+            instructions+=" This turn requires project evidence. Acknowledge missing requested facts explicitly."
         options=[(p.provider,p.model,secret(db,p.provider))]
         if p.fallback_provider:
             options.append((p.fallback_provider,p.fallback_model,secret(db,p.fallback_provider)))
@@ -397,7 +404,7 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None):
                     last="Monthly budget reached."
                     break
                 db.execute("INSERT INTO agent_usage(id,pid,provider,model,estimated_usd) VALUES (%s,%s,%s,%s,%s)",(usage_id,pid,provider,model,estimate))
-            text,input_tokens,output_tokens=generate({"provider":provider,"model":model},prompt,refs,history,secret=key,instructions=instructions,language=p.language,max_tokens=p.max_tokens,temperature=p.temperature,emit=on_text if emit else None)
+            text,input_tokens,output_tokens=generate({"provider":provider,"model":model},prompt,refs,history,secret=key,instructions=instructions,language=p.language,max_tokens=min(p.max_tokens,512) if action=="route" else p.max_tokens,temperature=p.temperature,emit=on_text if emit else None)
             if input_tokens is not None and output_tokens is not None:
                 with database() as db:
                     db.execute("UPDATE agent_usage SET settled=true,input_tokens=%s,output_tokens=%s,estimated_usd=%s WHERE id=%s",(input_tokens,output_tokens,(input_tokens*p.input_rate+output_tokens*p.output_rate)/1000000,usage_id))
@@ -426,15 +433,17 @@ def message(pid:str,data:Message,user=Depends(member)):
             sid=add_source(db,pid,data.body[:70],data.category,"Manual entry","",None,None,data.body)
             audit(db,user,pid,"knowledge.saved",sid)
             return {"saved":sid}
-        refs=evidence(db,pid,data.body,chat=True)
         _,policy=agent_settings(db)
-        if not policy.approved_only:
-            related=db.execute("SELECT service,remote_id,record,happened FROM delivery_events WHERE pid=%s ORDER BY happened DESC LIMIT 60",(pid,)).fetchall()
-            activity=[dict(id=x["remote_id"],title=x["service"]+" activity",state="recorded",body=json.dumps(x["record"],default=str)) for x in related]
-            matches=retrieve(activity,data.body,3)
-            refs=refs[:max(0,policy.context_passages-len(matches))]+matches
         history=db.execute("""SELECT role,left(body,1000) AS body FROM messages WHERE pid=%s AND (thread_id IS NULL OR thread_id='legacy-'||pid) AND created>coalesce((SELECT max(created) FROM audit WHERE pid=%s AND action='source.approved'),'-infinity'::timestamptz) ORDER BY created DESC LIMIT 12""",(pid,pid)).fetchall()[::-1]
-    answer,model,refs=ask(user,pid,"answer",data.body,refs,history)
+        history=history[-policy.history_messages:] if policy.history_messages else []
+    intent=plan_turn(ask,user,pid,data.body,history)
+    with database() as db:
+        refs=evidence(db,pid,intent.query,True,history,breadth=intent.kind=="overview",original=data.body) if "documents" in intent.sources or (policy.approved_only and "activity" in intent.sources) else []
+        if "activity" in intent.sources and not policy.approved_only:
+            from .chat import activity_context
+            matches = activity_context(db, pid, policy, intent.query)
+            refs = refs[:policy.context_passages-len(matches)] + matches
+    answer,model,refs=ask(user,pid,"answer",data.body,refs,history,intent=intent)
     with database() as db:
         legacy="legacy-"+pid
         db.execute("INSERT INTO chat_threads(id,pid,title) VALUES(%s,%s,'Earlier project chat') ON CONFLICT DO NOTHING",(legacy,pid))

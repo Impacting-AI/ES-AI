@@ -61,6 +61,15 @@ def run():
                 assert any(ref.get("sid")==saved["id"] for ref in answer["citations"])
                 follow=send("Repeat that identifier exactly.",1)
                 assert marker in follow["body"]
+                greeting=send("Hi",2)
+                assert len(greeting["body"].split())<=20 and not greeting["citations"]
+                simple=send("What is Jira?",3)
+                assert len(simple["body"].split())<=85 and not simple["citations"]
+                assert marker not in simple["body"] and "cobalt" not in simple["body"].lower()
+                missing=send("What is the approved project budget?",4)
+                assert not any(c.isdigit() for c in missing["body"].split("[")[0])
+                print("Review actual responses for tone and grounding:")
+                for turn in (greeting,simple,missing):print(turn["body"])
                 print("PASS: unique identifier, saved citation, streaming and contextual follow-up.")
             passed.append(service)
             print("PASS:",service,"generation and message retrieval" if service==d["policy"]["provider"] else "identity and resource discovery")
