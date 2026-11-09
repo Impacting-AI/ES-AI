@@ -19,12 +19,12 @@ class ReliabilityTests(unittest.TestCase):
         with patch("server.models.Client.events",stream):
             for i in range(25):
                 prompt=f"Review milestone {i}"
-                answer,_,_=generate({"provider":"OpenAI","model":"gpt-4o","question":prompt},prompt+"\n"+"notes "*8000,rows,history,secret="fixture",emit=lambda _:None)
+                answer,_,_=generate({"provider":"OpenAI","model":"gpt-4o","question":prompt,"context_window":48000},prompt+"\n"+"notes "*8000,rows,history,secret="fixture",emit=lambda _:None)
                 self.assertEqual(answer,"Reviewed.")
                 history += [dict(role="user",body=prompt),dict(role="assistant",body="点"*1000)]
     def test_limits_preserve_question_or_explicitly_fail(self):
         with self.assertRaises(ServiceFailure):
-            fit_context("gpt-4","文"*3000,[],[],"",2000)
+            fit_context("custom","文"*3000,[],[],"",2000,window_override=1900)
         content=fit_context("custom","Hi",[],[],"",100,window_override=1024)
         self.assertEqual(json.loads(content)["request"],"Hi")
     def test_retry_headers_and_sanitization(self):

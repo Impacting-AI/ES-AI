@@ -50,6 +50,7 @@ def failure(status, body=b"", headers=None):
     return exc
 
 def classify(status, body):
+    e={}
     try:
         payload=json.loads(body)
         e=payload.get("error",{})
@@ -66,7 +67,17 @@ def classify(status, body):
     if status==404 or any(s in reason for s in ("model_not_found","unknown_model")):
         return ServiceFailure("Requested model or resource unavailable",404)
     if status==429 or "rate_limit_exceeded" in reason or "rate_limit_error" in reason:return ServiceFailure("Service rate limit reached",429,transient=True)
-    if status in (400,422) and "stream" in reason:return ServiceFailure("Unsupported stream parameters",422)
+    if status in (400,422) and re.search(r"\b(stream|stream_options|streaming)\b",reason) and any(s in reason for s in ("unsupported","not support","unrecognized","unknown parameter")):return ServiceFailure("Unsupported stream parameters",422)
+    if status in (400,422) and isinstance(e,dict):
+        param=e.get("param") or ""
+        msg=str(e.get("message",""))
+        if not param:
+            match=re.search(r"(?:parameter|field|argument|unknown name)[: ]+['\"]([A-Za-z_][.\w]*)['\"]|^([a-z_][.\w]*)\s*:",msg,re.I)
+            param=next((g for g in match.groups() if g),"") if match else ""
+        if isinstance(param,str) and re.fullmatch(r"[a-zA-Z_][.\w]{0,95}",param):
+            limits=re.search(r"(?:at most|less than or equal to|maximum(?: value)?(?: is| of)?|supports at most)\s+([\d,.]+)",msg,re.I)
+            note=(" Provider maximum: "+limits[1].rstrip(".")+".") if limits else ""
+            return ServiceFailure("The selected model rejected parameter "+param+". Change or remove it."+note,422)
     if status in (400,422):return ServiceFailure("Service rejected the selected model parameters or request fields",422)
     return ServiceFailure("Network or service error",502,transient=status in (408,500,502,503,504,529))
 

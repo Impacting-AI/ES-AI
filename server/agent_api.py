@@ -116,7 +116,10 @@ def router(uid,admin_user,access,member,answer,plan,ask):
         service_name(service)
         with database() as db:
             _,p=settings(db);key=secret(db,service)
-        try:return {"result":connection(service,p,key)}
+        from .discovery import probe
+        from .transport import ServiceFailure
+        try:return {"result":probe(service,p,key)}
+        except ServiceFailure as e:raise HTTPException(e.code,e.category)
         except ValueError as e:raise HTTPException(422,str(e))
         except Exception:raise HTTPException(502,"Connection test failed. Verify the service, credential and required permissions.")
 

@@ -3,6 +3,7 @@ from urllib.parse import quote
 import hashlib
 import hmac
 import json
+from .model_options import model_config
 from .models import PROVIDERS,generate
 from .transport import Client,ServiceFailure,failure
 from .connectors import checked,connection
@@ -11,11 +12,12 @@ from .connectors import checked,connection
 def fingerprint(signing_key,service,policy,key):
     attributes=[service,key]
     if service in PROVIDERS:
-        attributes+= [selected_model(policy,service),policy.fallback_model if policy.fallback_provider==service else "",policy.max_tokens,policy.temperature]
+        attributes += [model_config(policy,flag) for flag in (False,True)
+                       if (policy.fallback_provider if flag else policy.provider)==service]
     if service=="Jira":attributes += [policy.jira_site,policy.jira_email]
     if service=="Slack":attributes += [policy.slack_team]
     if service=="Email":attributes += [policy.email_sender]
-    return hmac.new(signing_key.encode(),json.dumps(attributes).encode(),hashlib.sha256).hexdigest()
+    return hmac.new(signing_key.encode(),json.dumps(attributes,sort_keys=True).encode(),hashlib.sha256).hexdigest()
 
 
 def selected_model(p,service):
@@ -24,15 +26,46 @@ def selected_model(p,service):
     return ""
 
 
+def limit_warnings(config,limit,key):
+    """Discovery is advisory: some valid aliases/accounts allow generation only."""
+    provider=config["provider"]
+    if provider=="OpenAI":return []
+    if provider=="Gemini":
+        name=quote(config["model"].removeprefix("models/"),safe="")
+        url="https://generativelanguage.googleapis.com/v1beta/models/"+name
+        headers={"x-goog-api-key":key}
+        input_key,output_key="inputTokenLimit","outputTokenLimit"
+    else:
+        url="https://api.anthropic.com/v1/models/"+quote(config["model"],safe="")
+        headers={"x-api-key":key,"anthropic-version":"2023-06-01"}
+        input_key,output_key="max_input_tokens","max_tokens"
+    try:
+        with Client(timeout=8) as client:
+            result=client.get(url,headers=headers)
+        if result.status_code!=200:return []
+        info=result.json()
+    except (ServiceFailure,ValueError):return []
+    warnings=[]
+    for label,value,maximum in (("maximum output tokens",limit,info.get(output_key)),
+                                ("input budget",config["context_window"]-(limit or 0),info.get(input_key))):
+        if value and isinstance(maximum,int) and value>maximum:
+            warnings.append(f"{config['model']}: configured {label} {value} exceeds the provider limit {maximum}.")
+    return warnings
+
 def probe(service,p,key):
     if not key:raise ServiceFailure("Enter or save a credential first",422)
     if service in PROVIDERS:
         model=selected_model(p,service)
         if not model:raise ServiceFailure("Select this provider and enter a model ID first",422)
-        models=[model]
-        if p.fallback_provider==service and p.fallback_model and p.fallback_model!=model:models.append(p.fallback_model)
-        for name in models:
-            answer,_,_=generate(dict(provider=service,model=name),"Reply with the word OK.",[],secret=key,max_tokens=min(256,p.max_tokens),temperature=p.temperature)
+        models=[]
+        for fallback in (False,True):
+            config,limit,temperature=model_config(p,fallback)
+            if service!=config["provider"]:continue
+            name=config["model"]
+            models.append(name)
+            warnings=limit_warnings(config,limit,key)
+            if warnings:raise ServiceFailure(" ".join(warnings),422)
+            answer,_,_=generate(config,"Reply with the word OK.",[],secret=key,max_tokens=limit,temperature=temperature)
             if not isinstance(answer,str) or not answer.strip():raise ServiceFailure("Model returned no usable text",422)
         return "Verified text generation with "+", ".join(models)
     if service=="Slack":

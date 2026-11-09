@@ -1,3 +1,4 @@
+from .model_options import model_config
 from .conversation import plan_turn, ROUTER
 import hashlib
 import math
@@ -357,15 +358,6 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None,intent=None,tid=None,ca
             # Conversation history is labelled non-authoritative in the model policy.
         if action in {"answer","feedback"}:
             refs=refs[:p.context_passages]
-            # Keep room for the question, reviewed guidance and recent turns with multibyte input.
-            budget=24000
-            bounded=[]
-            for ref in refs:
-                encoded=json.dumps(ref,default=str,ensure_ascii=False).encode()
-                if len(encoded)>budget:continue
-                bounded.append(ref)
-                budget-=len(encoded)
-            refs=bounded
             history=history[-p.history_messages:] if p.history_messages else []
         if action not in {"answer","route"} or (intent and "profile" in intent.sources):
             profile=db.execute("SELECT profile FROM projects WHERE id=%s",(pid,)).fetchone()["profile"]
@@ -400,7 +392,8 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None,intent=None,tid=None,ca
         if not key:
             raise_error = "Configure the selected provider credential in AI settings."
             break
-        request_window=p.fallback_context_window if option_index else p.context_window
+        config,output_limit,temperature=model_config(p,bool(option_index))
+        config["question"]=question
         for index in range(2):
             record = dict(provider=provider, model=model, attempt=index+1, status="failed")
             attempts.append(record)
@@ -412,7 +405,8 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None,intent=None,tid=None,ca
                 throttle("ai:"+user,p.hourly_calls,3600)
                 usage_id=ident()
                 prompt_bytes=len(json.dumps([prompt,refs,history,instructions,POLICY,p.language],default=str).encode())+256
-                output_limit=min(p.max_tokens,512) if action=="route" else p.max_tokens
+                if p.monthly_budget and output_limit is None:
+                    raise ServiceFailure("Set maximum output tokens to reserve usage against the monthly budget.",422)
                 estimate=reserve_estimate(p.model_copy(update={"max_tokens":output_limit}),prompt_bytes)
                 with database() as db:
                     db.execute("SELECT pg_advisory_xact_lock(507715)")
@@ -422,7 +416,7 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None,intent=None,tid=None,ca
                     db.execute("INSERT INTO agent_usage(id,pid,provider,model,estimated_usd) VALUES (%s,%s,%s,%s,%s)",(usage_id,pid,provider,model,estimate))
                 record["estimated_usd"]=estimate
                 stage = "model response"
-                text,input_tokens,output_tokens=generate({"provider":provider,"model":model,"question":question,"context_window":request_window},prompt,refs,history,secret=key,instructions=instructions,language=p.language,max_tokens=output_limit,temperature=p.temperature,emit=on_text if emit else None,diagnostics=record)
+                text,input_tokens,output_tokens=generate(config,prompt,refs,history,secret=key,instructions=instructions,language=p.language,max_tokens=output_limit,temperature=temperature,emit=on_text if emit else None,diagnostics=record)
                 if not text or not text.strip():
                     raise ServiceFailure("Model returned no answer. Check its output limit and configuration.",422)
                 stage = "usage settlement"
@@ -444,7 +438,6 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None,intent=None,tid=None,ca
                     record.update(input_tokens=0,output_tokens=0,estimated_usd=0)
                 if exc.request_id:record["request_id"]=exc.request_id
                 if status==413 and index==0 and not started and exc.category.startswith("Model context") and (refs or history):
-                    request_window=min(request_window or 8192,8192)
                     refs=refs[:max(1,len(refs)//2)]
                     history=history[-2:]
                     continue
@@ -486,7 +479,7 @@ def message(pid:str,data:Message,user=Depends(member)):
             audit(db,user,pid,"knowledge.saved",sid)
             return {"saved":sid}
         _,policy=agent_settings(db)
-        history=db.execute("""SELECT role,left(body,1000) AS body FROM messages WHERE pid=%s AND (thread_id IS NULL OR thread_id='legacy-'||pid) AND created>coalesce((SELECT max(created) FROM audit WHERE pid=%s AND action='source.approved'),'-infinity'::timestamptz) ORDER BY created DESC LIMIT 12""",(pid,pid)).fetchall()[::-1]
+        history=db.execute("""SELECT role,left(body,1000) AS body FROM messages WHERE pid=%s AND (thread_id IS NULL OR thread_id='legacy-'||pid) AND created>coalesce((SELECT max(created) FROM audit WHERE pid=%s AND action='source.approved'),'-infinity'::timestamptz) ORDER BY created DESC LIMIT %s""",(pid,pid,policy.history_messages)).fetchall()[::-1]
         history=history[-policy.history_messages:] if policy.history_messages else []
     intent=plan_turn(ask,user,pid,data.body,history)
     with database() as db:
@@ -512,7 +505,7 @@ def search(pid:str,q:str,user=Depends(member)):
 
 class Config(BaseModel):
     provider:str
-    model:str=Field(pattern=r"^[a-zA-Z0-9._:-]{1,120}$")
+    model:str=Field(min_length=1)
 
 
 @app.get("/api/settings")
@@ -527,7 +520,8 @@ def configure(data:Config,user=Depends(admin_user)):
     if data.provider not in PROVIDERS: raise HTTPException(422,"Unknown provider.")
     with database() as db:
         rev,p=agent_settings(db,True)
-        save_policy(db,user,p.model_copy(update=data.model_dump()),rev)
+        try:save_policy(db,user,p.model_copy(update=data.model_dump()),rev)
+        except ValueError as exc:raise HTTPException(422,str(exc))
     return {"saved":True}
 
 

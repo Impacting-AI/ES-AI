@@ -3,11 +3,9 @@ import json
 from .transport import ServiceFailure
 
 def fit_context(model, prompt, evidence, history, policy, max_output, question=None, window_override=0):
-    # Application ceiling for larger models. Use a conservative ceiling for unknown IDs.
-    large = model.startswith(("gpt-4o","gpt-4.1","gpt-5","claude-3","claude-sonnet","claude-opus","gemini-"))
-    window = 65536 if large else 16385 if model == "gpt-3.5-turbo" else 8192
-    window = window_override or window
-    budget = min(48000, window - max_output - 256) - len(policy.encode())
+    # Only an explicitly configured window triggers local evidence trimming.
+    # UTF-8 bytes are a conservative estimate. The provider validates the final token count.
+    budget = max(0,window_override-(max_output or 0)-len(policy.encode())) if window_override else float("inf")
     def encode():
         return json.dumps(dict(request=prompt, excerpts=refs, prior_messages=turns),
                           default=str, ensure_ascii=False, separators=(",",":"))
@@ -17,8 +15,8 @@ def fit_context(model, prompt, evidence, history, policy, max_output, question=N
         while supplemental and len(encode().encode())>budget//2:
             supplemental=supplemental[:len(supplemental)//2]
             prompt=question+supplemental
-    if len(encode().encode()) > budget:
-        raise ServiceFailure("Request exceeds the model input budget. Shorten the message or reduce the output limit.",413)
+    if window_override and max_output and max_output>=window_override:
+        raise ServiceFailure("Maximum output tokens must leave room for input in the configured context window.",413)
     seen = set()
     for ref in evidence:
         key = (ref.get("id"), ref.get("body",""))

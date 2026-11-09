@@ -84,7 +84,7 @@ def select_context(rows,question,history,limit,*,breadth=None):
         ordered=list(first.values())[:limit]
     else:ordered=list(matches[:limit])
     seen={r['id'] for r in ordered}
-    for i in range(limit):
+    for i in range(min(limit,max(map(len,groups.values()),default=0))):
         for group in groups.values():
             if len(ordered)>=limit:return ordered
             if i<len(group) and group[i]['id'] not in seen:

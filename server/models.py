@@ -2,6 +2,7 @@ import json
 import os
 from urllib.parse import quote
 from .transport import Client,ServiceFailure,failure,response_metadata
+from .model_options import generation_options
 from .request_context import fit_context
 
 PROVIDERS = {"OpenAI":"OPENAI_API_KEY","Anthropic":"ANTHROPIC_API_KEY","Gemini":"GEMINI_API_KEY"}
@@ -24,24 +25,21 @@ def generate(config, prompt, evidence, history=(), *, secret=None, instructions=
     policy = POLICY + "\nOutput language: "+language+". Administrator guidance: "+instructions
     if not secret:
         raise ValueError("Configure the selected provider's server-side key.")
+    options=generation_options(config,max_tokens,temperature)
     content=fit_context(model,prompt,evidence,history,policy,max_tokens,config.get("question"),config.get("context_window",0))
     if diagnostics is not None:diagnostics["used_ids"]=[r.get("id") for r in json.loads(content)["excerpts"]]
     if provider == "OpenAI":
         url = "https://api.openai.com/v1/chat/completions"
         headers = {"Authorization":f"Bearer {secret}"}
-        payload = dict(model=model,max_completion_tokens=max_tokens,messages=[dict(role="system",content=policy),dict(role="user",content=content)])
+        payload = dict(model=model,**options,messages=[dict(role="system",content=policy),dict(role="user",content=content)])
     elif provider == "Anthropic":
         url = "https://api.anthropic.com/v1/messages"
         headers = {"x-api-key":secret,"anthropic-version":"2023-06-01"}
-        payload = dict(model=model,max_tokens=max_tokens,system=policy,messages=[dict(role="user",content=content)])
+        payload = dict(model=model,**options,system=policy,messages=[dict(role="user",content=content)])
     else:
-        url = "https://generativelanguage.googleapis.com/v1beta/models/"+quote(model,safe="")+":generateContent"
+        url = "https://generativelanguage.googleapis.com/v1beta/models/"+quote(model.removeprefix("models/"),safe="")+":generateContent"
         headers = {"x-goog-api-key":secret}
-        payload = dict(systemInstruction={"parts":[{"text":policy}]},contents=[{"parts":[{"text":content}]}],generationConfig={"maxOutputTokens":max_tokens})
-    if temperature is not None:
-        if provider=="Gemini":payload["generationConfig"]["temperature"]=temperature
-        elif provider!="OpenAI" or not model.startswith(("o1","o3","o4","gpt-5")):
-            payload["temperature"]=temperature
+        payload = dict(systemInstruction={"parts":[{"text":policy}]},contents=[{"parts":[{"text":content}]}],generationConfig=options)
     if emit is not None:
         if provider=="Gemini":url=url.replace(":generateContent",":streamGenerateContent?alt=sse")
         else:payload["stream"]=True

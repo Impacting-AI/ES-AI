@@ -1,6 +1,8 @@
 import os
 from .agent_policy import Policy
 from .db import cipher
+from .model_options import model_config,generation_options
+from .transport import ServiceFailure
 from .models import PROVIDERS
 
 AGENT="pm-ai-es"
@@ -24,6 +26,15 @@ def save(db,user,policy,revision):
     if revision!=current:raise ValueError("Settings changed in another session. Reload and retry.")
     if policy.monthly_budget and not (policy.input_rate and policy.output_rate):raise ValueError("Set both token prices before enabling a monthly budget.")
     if bool(policy.fallback_provider)!=bool(policy.fallback_model):raise ValueError("Fallback needs both provider and model.")
+    for fallback in (False,True):
+        config,limit,temperature=model_config(policy,fallback)
+        if not config["provider"] or not config["model"]:continue
+        if policy.monthly_budget and limit is None:
+            raise ValueError("Set maximum output tokens to reserve usage against the monthly budget.")
+        if config["context_window"] and limit and limit>=config["context_window"]:
+            raise ValueError("The context window must leave room for both the input and the response.")
+        try:generation_options(config,limit,temperature)
+        except ServiceFailure as exc:raise ValueError(exc.category) from exc
     if policy.jira_site!=old.jira_site and secret(db,"Jira"):
         db.execute("INSERT INTO agent_credentials(agent_id,service,encrypted) VALUES (%s,'Jira',NULL) ON CONFLICT(agent_id,service) DO UPDATE SET encrypted=NULL,updated=now()",(AGENT,))
     db.execute("INSERT INTO agent_versions(agent_id,revision,policy,actor) VALUES (%s,%s,%s::jsonb,%s) ON CONFLICT DO NOTHING",(AGENT,current,old.model_dump_json(),user))

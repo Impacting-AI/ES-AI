@@ -23,7 +23,7 @@ class AgentTests(unittest.TestCase):
             with self.assertRaises(ValueError):permitted(Policy(**{flag:False}),tool)
 
     def test_invalid_config(self):
-        for bad in [{'jira_site':'https://example.org'},{'timezone':'bad-zone'},{'max_tokens':99999},{'slack_team':'abc'}]:
+        for bad in [{'jira_site':'https://example.org'},{'timezone':'bad-zone'},{'max_tokens':-1},{'slack_team':'abc'}]:
             with self.assertRaises(ValidationError):Policy(**bad)
 
     def test_router(self):

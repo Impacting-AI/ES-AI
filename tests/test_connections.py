@@ -18,7 +18,8 @@ class ConnectionTests(unittest.TestCase):
     def test_selected_model_generates_text(self,generate):
         generate.return_value=("OK",8,1)
         self.assertIn("model-a",probe("OpenAI",self.p,"test-key"))
-        self.assertEqual(generate.call_args.args[0],{"provider":"OpenAI","model":"model-a"})
+        self.assertEqual(generate.call_args.args[0]["model"],"model-a")
+        self.assertEqual(generate.call_args.kwargs["max_tokens"],self.p.max_tokens)
         self.assertEqual(generate.call_args.kwargs["secret"],"test-key")
 
     @patch("server.discovery.generate")

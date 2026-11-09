@@ -1,5 +1,6 @@
 """Typed, versioned configuration for the Project Management agent."""
 from typing import Literal
+import json
 from zoneinfo import ZoneInfo
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -15,27 +16,37 @@ class Policy(BaseModel):
     timezone: str = "Asia/Karachi"
     mode: Literal["Analyse","Draft","Approved actions"] = "Draft"
     provider: Provider = "OpenAI"
-    model: str = Field(default="",pattern=r"^[A-Za-z0-9._:-]{0,120}$")
+    model: str = ""
     instructions: str = Field(default="Use simple English. Cite approved scope and flag missing evidence.",max_length=4000)
     response_preference:Literal["Concise","Balanced","Detailed"]="Concise"
-    temperature: float | None = Field(default=None,ge=0,le=1,allow_inf_nan=False)
+    temperature: float | None = Field(default=None,allow_inf_nan=False)
     jira_default: str = Field(default="",pattern=r"^$|^[A-Z][A-Z0-9]{1,19}$")
     jira_status_map: dict[str,Literal["Remaining","In progress","Review","Done","Blocked"]] = Field(default_factory=dict,max_length=100)
     poll_minutes: Literal[0,5,15,30,60] = 0
     sync_jira: bool = True
     sync_slack: bool = True
     slack_notifications: bool = False
-    context_window: int = Field(default=0,ge=0,le=4000000)
-    fallback_context_window: int = Field(default=0,ge=0,le=4000000)
-    max_tokens: int = Field(default=2400,ge=128,le=8000)
-    monthly_budget: float = Field(default=0,ge=0,le=100000,allow_inf_nan=False)
-    input_rate: float = Field(default=0,ge=0,le=1000,allow_inf_nan=False)
-    output_rate: float = Field(default=0,ge=0,le=1000,allow_inf_nan=False)
-    hourly_calls: int = Field(default=30,ge=1,le=120)
-    context_passages: int = Field(default=8,ge=1,le=20)
-    history_messages: int = Field(default=6,ge=0,le=12)
+    context_window: int = Field(default=0,ge=0)
+    fallback_context_window: int = Field(default=0,ge=0)
+    max_tokens: int | None = Field(default=2400,gt=0)
+    top_p: float | None = Field(default=None,allow_inf_nan=False)
+    reasoning_effort: str | None = None
+    parameters: dict = Field(default_factory=dict)
+    fallback_parameters: dict = Field(default_factory=dict)
+    fallback_inherit: bool = True
+    fallback_max_tokens: int | None = Field(default=None,gt=0)
+    fallback_temperature: float | None = Field(default=None,allow_inf_nan=False)
+    fallback_top_p: float | None = Field(default=None,allow_inf_nan=False)
+    fallback_reasoning_effort: str | None = None
+
+    monthly_budget: float = Field(default=0,ge=0,allow_inf_nan=False)
+    input_rate: float = Field(default=0,ge=0,allow_inf_nan=False)
+    output_rate: float = Field(default=0,ge=0,allow_inf_nan=False)
+    hourly_calls: int = Field(default=30,ge=1)
+    context_passages: int = Field(default=8,ge=1)
+    history_messages: int = Field(default=6,ge=0)
     fallback_provider: Literal["","OpenAI","Anthropic","Gemini"] = ""
-    fallback_model: str = Field(default="",pattern=r"^[A-Za-z0-9._:-]{0,120}$")
+    fallback_model: str = ""
     approved_only: bool = False
     allow_chat: bool = True
     allow_plan: bool = True
@@ -48,6 +59,14 @@ class Policy(BaseModel):
     digest_frequency: Literal["Daily","Weekly"] = "Daily"
     digest_weekday: int = Field(default=0,ge=0,le=6)
     digest_hour: int = Field(default=9,ge=0,le=23)
+
+    @field_validator("parameters","fallback_parameters",mode="before")
+    @classmethod
+    def parse_parameters(cls,value):
+        if isinstance(value,str):
+            try:return json.loads(value.strip() or "{}")
+            except ValueError:raise ValueError("Enter a valid JSON object for generation parameters.")
+        return value
 
     @field_validator("timezone")
     @classmethod
@@ -86,7 +105,7 @@ def health_snapshot(sources,plans,issues=(),today=None):
 def reserve_estimate(policy,prompt_bytes):
     if policy.monthly_budget and not (policy.input_rate>0 and policy.output_rate>0):
         raise ValueError("Set conservative input and output prices before enabling a budget.")
-    return ((prompt_bytes+512)*policy.input_rate+policy.max_tokens*policy.output_rate)/1_000_000
+    return ((prompt_bytes+512)*policy.input_rate+(policy.max_tokens or 0)*policy.output_rate)/1_000_000
 
 def choose_tool(request):
     """Route explicit commands; open-ended questions use project evidence."""
