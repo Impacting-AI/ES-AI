@@ -23,7 +23,7 @@ def create_report(db,pid,user,data,zone=timezone.utc,heading=""):
     end=datetime.combine(data.end,datetime.min.time(),zone)+timedelta(days=1)
     project=db.execute("SELECT name,client,profile FROM projects WHERE id=%s",(pid,)).fetchone()
     head=db.execute("SELECT name FROM project_staff WHERE pid=%s AND lower(role) IN ('project manager','project head') ORDER BY name LIMIT 1",(pid,)).fetchone()
-    events=db.execute("SELECT service,record FROM delivery_events WHERE pid=%s AND happened>=%s AND happened<%s ORDER BY happened",(pid,start,end)).fetchall()
+    events=db.execute("SELECT service,record FROM mapped_delivery_events WHERE pid=%s AND happened>=%s AND happened<%s ORDER BY happened",(pid,start,end)).fetchall()
     approved=db.execute("SELECT s.title,s.version FROM audit a JOIN sources s ON s.id=a.subject AND s.pid=a.pid WHERE a.pid=%s AND a.action='source.approved' AND a.created>=%s AND a.created<%s ORDER BY a.created",(pid,start,end)).fetchall()
     text=(heading+"\n\n" if heading else "")+render(project,project['profile'].get('head') or (head['name'] if head else None),data,events,approved).replace("(UTC)",f"({zone})",1)
     if len(text)>16000:text=text[:15800]+"\n[Report truncated. Generate a shorter reporting period for the remaining records.]"

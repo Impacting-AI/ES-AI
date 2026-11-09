@@ -118,20 +118,35 @@ def options(service,resource,p,key,project="",cursor="",query=""):
         is_channel=resource=="channels"
         params={"limit":100,**({"cursor":cursor} if cursor else {})}
         if is_channel:params.update(types="public_channel,private_channel",exclude_archived="true")
-        data=checked(c.get("https://slack.com/api/"+("conversations.list" if is_channel else "users.list"),headers=headers,params=params))
+        data=checked(c.get("https://slack.com/api/"+("users.conversations" if is_channel else "users.list"),headers=headers,params=params))
         return {"items":[{"id":x["id"],"name":x.get("real_name") or x.get("name") or x["id"]} for x in data.get("channels" if is_channel else "members",[]) if not x.get("deleted")],"next":data.get("response_metadata",{}).get("next_cursor","")}
 
 def verify_binding(service,destination,p,key):
     """Prove that the target belongs to this workspace before saving a binding."""
+    import re
+    destination=destination.strip().upper()
+    if service not in {"Jira","Slack"}:raise ServiceFailure("Unknown service.",422)
+    pattern=r"(?:[A-Z][A-Z0-9_]+|[0-9]+)" if service=="Jira" else r"[CG][A-Z0-9]+"
+    if not re.fullmatch(pattern,destination):raise ServiceFailure("Enter a Jira project ID or key." if service=="Jira" else "Enter a Slack channel ID beginning with C or G.",422)
     with Client(timeout=15) as c:
         if service=="Jira":
-            response=checked(c.get(p.jira_site+"/rest/api/3/project/"+destination,auth=(p.jira_email,key)))
-            if response.get("key")!=destination:raise ServiceFailure("Project key mismatch",422)
-        else:
-            from .connectors import slack_identity
-            slack_identity(c,p,key)
-            data=checked(c.get("https://slack.com/api/conversations.info",headers={"Authorization":"Bearer "+key},params={"channel":destination}))
-            if data.get("channel",{}).get("id")!=destination:raise ServiceFailure("Channel unavailable",422)
+            auth=(p.jira_email,key)
+            row=checked(c.get(p.jira_site+"/rest/api/3/project/"+destination,auth=auth))
+            canonical=row.get("key","")
+            if destination not in (str(row.get("id")),canonical) or not re.fullmatch(r"[A-Z][A-Z0-9_]+",canonical):
+                raise ServiceFailure("Jira returned a different project.",422)
+            perms=checked(c.get(p.jira_site+"/rest/api/3/mypermissions",auth=auth,params={"projectKey":canonical,"permissions":"BROWSE_PROJECTS"}))
+            if not perms.get("permissions",{}).get("BROWSE_PROJECTS",{}).get("havePermission"):
+                raise ServiceFailure("Grant Browse Projects for this Jira project.",403)
+            return dict(destination=canonical,external_id=str(row["id"]),resource_name=row["name"],resource_url=p.jira_site+"/browse/"+canonical)
+        from .connectors import slack_identity
+        slack_identity(c,p,key)
+        headers={"Authorization":"Bearer "+key}
+        row=checked(c.get("https://slack.com/api/conversations.info",headers=headers,params={"channel":destination}))["channel"]
+        if row.get("id")!=destination or row.get("is_archived") or not row.get("is_member"):
+            raise ServiceFailure("Invite the bot to an active channel in the configured Slack workspace.",403)
+        checked(c.get("https://slack.com/api/conversations.history",headers=headers,params={"channel":destination,"limit":1}))
+        return dict(destination=destination,external_id=destination,resource_name=row["name"],resource_url="https://app.slack.com/client/"+p.slack_team+"/"+destination)
 
 
 def jira_preflight(action,p,key):

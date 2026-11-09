@@ -62,9 +62,9 @@ def classify(status, body):
         return ServiceFailure("Quota or billing limit reached",429)
     if status==401 or any(s in reason for s in ("api_key_invalid","invalid_auth","invalid_api_key","token_revoked","not_authed")):
         return ServiceFailure("Invalid credentials",401)
-    if status==403 or any(s in reason for s in ("missing_scope","insufficient_permissions","not_in_channel")):
+    if status==403 or any(s in reason for s in ("missing_scope","insufficient_permissions","not_in_channel","not_allowed_token_type")):
         return ServiceFailure("Insufficient permissions",403)
-    if status==404 or any(s in reason for s in ("model_not_found","unknown_model")):
+    if status==404 or any(s in reason for s in ("model_not_found","unknown_model","channel_not_found","thread_not_found")):
         return ServiceFailure("Requested model or resource unavailable",404)
     if status==429 or "rate_limit_exceeded" in reason or "rate_limit_error" in reason:return ServiceFailure("Service rate limit reached",429,transient=True)
     if status in (400,422) and re.search(r"\b(stream|stream_options|streaming)\b",reason) and any(s in reason for s in ("unsupported","not support","unrecognized","unknown parameter")):return ServiceFailure("Unsupported stream parameters",422)

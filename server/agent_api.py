@@ -9,8 +9,26 @@ from .agent_policy import Policy,permitted,health_snapshot,choose_tool,ROLES,may
 from .connectors import publish,ExternalAction
 from .discovery import probe as connection, jira_preflight
 from .transport import ServiceFailure
+from .project_links import store_mapping,validate
 from .backlog import ordered_items
 
+
+def check_mapping(db,pid,action,p):
+    service=action.kind.split()[0]
+    if service not in ("Jira","Slack"):return
+    row=db.execute("SELECT * FROM project_links WHERE pid=%s AND service=%s",(pid,service)).fetchone()
+    if action.kind in ("Jira project","Slack channel"):
+        if row or db.execute("""SELECT 1 FROM agent_actions WHERE pid=%s AND service=%s AND
+            payload->>'kind'=%s AND status IN ('dispatching','needs reconciliation')""",(pid,service,action.kind)).fetchone():
+            raise HTTPException(409,"A mapping or unresolved creation already exists for this project.")
+        return
+    site=p.jira_site if service=="Jira" else p.slack_team
+    if not row or not row["verified_at"] or (row["workspace"],row["destination"])!=(site,action.destination):
+        raise HTTPException(409,"Verify the destination in Project settings before publishing.")
+    if action.kind=="Slack Jira update":
+        jira=db.execute("SELECT * FROM project_links WHERE pid=%s AND service='Jira'",(pid,)).fetchone()
+        if not jira or not jira["verified_at"] or jira["workspace"]!=p.jira_site or not action.reference.startswith(jira["destination"]+"-"):
+            raise HTTPException(409,"The issue must belong to this project's current Jira mapping.")
 
 def check_roster(db,pid,action):
     if action.kind=="Slack invitation":
@@ -135,7 +153,7 @@ def router(uid,admin_user,access,member,answer,plan,ask):
             rev,p=settings(db)
             try:permitted(p,"health")
             except ValueError as e:raise HTTPException(403,str(e))
-            body=health_snapshot(db.execute("SELECT state FROM sources WHERE pid=%s",(pid,)).fetchall(),db.execute("SELECT state FROM plans WHERE pid=%s",(pid,)).fetchall(),db.execute("SELECT DISTINCT ON (record->>'issue') record FROM delivery_events WHERE pid=%s AND service='Jira' ORDER BY record->>'issue',happened DESC",(pid,)).fetchall())
+            body=health_snapshot(db.execute("SELECT state FROM sources WHERE pid=%s",(pid,)).fetchall(),db.execute("SELECT state FROM plans WHERE pid=%s",(pid,)).fetchall(),db.execute("SELECT DISTINCT ON (record->>'issue') record FROM mapped_delivery_events WHERE pid=%s AND service='Jira' ORDER BY record->>'issue',happened DESC",(pid,)).fetchall())
             db.execute("INSERT INTO agent_runs(id,pid,uid,action,status,detail,revision,finished) VALUES (%s,%s,%s,'health','success',%s,%s,now())",(str(uuid4()),pid,user,body,rev))
         return {"answer":body}
 
@@ -185,6 +203,7 @@ def router(uid,admin_user,access,member,answer,plan,ask):
         with database() as db:
             rev,p=settings(db,True)
             if not p.enabled or p.mode!="Approved actions":raise HTTPException(403,"Choose Approved actions in General settings.")
+            check_mapping(db,pid,data,p)
             check_roster(db,pid,data)
             service=data.kind.split()[0]
             if not secret(db,service):raise HTTPException(409,"Configure the destination credential before preparing an action.")
@@ -196,7 +215,7 @@ def router(uid,admin_user,access,member,answer,plan,ask):
                 if not issue_project or issue_project["workspace"]!=p.jira_site or not data.reference.startswith(issue_project["destination"]+"-"):raise HTTPException(409,"Choose an issue from the linked Jira project.")
             if data.kind in {"Jira issue","Jira board","Jira relationship","Slack invitation","Slack Jira update"}:
                 bound=db.execute("SELECT destination,workspace FROM project_links WHERE pid=%s AND service=%s",(pid,service)).fetchone()
-                if not bound or (bound["workspace"],bound["destination"])!=(target,data.destination):raise HTTPException(409,"Link this destination first in the project's Team & delivery tab.")
+                if not bound or (bound["workspace"],bound["destination"])!=(target,data.destination):raise HTTPException(409,"Link this destination first in the project's Jira & Slack Connections.")
             row=db.execute("""INSERT INTO agent_actions(id,pid,service,payload,revision,created_by,target) VALUES (%s,%s,%s,%s::jsonb,%s,%s,%s)
                 ON CONFLICT DO NOTHING RETURNING id""",(str(uuid4()),pid,service,data.model_dump_json(),rev,user,target)).fetchone()
             if not row:raise HTTPException(409,"This exact action already exists. Review its status.")
@@ -212,6 +231,7 @@ def router(uid,admin_user,access,member,answer,plan,ask):
             if not row or row["status"]!="draft":raise HTTPException(409,"Action already handled or unavailable.")
             if decision=="approve" and (not p.enabled or p.mode!="Approved actions" or row["revision"]!=revision):raise HTTPException(409,"Settings changed or execution disabled. Prepare a new action.")
             if decision=="approve":
+                check_mapping(db,pid,ExternalAction(**row["payload"]),p)
                 check_roster(db,pid,ExternalAction(**row["payload"]))
                 twin=db.execute("SELECT 1 FROM agent_actions WHERE pid=%s AND service=%s AND target=%s AND payload=%s::jsonb AND status IN ('dispatching','confirmed','needs reconciliation') LIMIT 1",(pid,row["service"],row["target"],json.dumps(row["payload"]))).fetchone()
                 if twin:raise HTTPException(409,"This action already has a dispatch record. Reconcile before any further action.")
@@ -242,7 +262,24 @@ def router(uid,admin_user,access,member,answer,plan,ask):
             status="confirmed"
         except Exception:
             remote=None;status="needs reconciliation"
+        resource=None
+        verified=False
+        if status=="confirmed" and row["payload"]["kind"] in ("Jira project","Slack channel"):
+            site=row["target"]
+            try:
+                resource=validate(row["service"],remote,None,p,key)
+                verified=True
+            except Exception:
+                # Keep the creation receipt even when the follow-up read fails.
+                url=(site+"/browse/"+remote if row["service"]=="Jira" else "https://app.slack.com/client/"+site+"/"+remote)
+                resource=dict(destination=remote,external_id=remote,resource_name=row["payload"]["title"],resource_url=url)
         with database() as db:
+            current,_=settings(db,True)
+            if resource:
+                try:store_mapping(db,pid,row["service"],site,resource)
+                except ServiceFailure:status="needs reconciliation"
+                if status=="confirmed" and (not verified or current!=revision):
+                    db.execute("UPDATE project_links SET verified_at=NULL,sync_status='Created; verification pending' WHERE pid=%s AND service=%s",(pid,row["service"]))
             db.execute("UPDATE agent_actions SET status=%s,remote_id=%s WHERE id=%s",(status,remote,aid))
             db.execute("INSERT INTO audit(uid,pid,action,subject) VALUES (%s,%s,%s,%s)",(user,pid,"external."+status,aid))
         return {"status":status,"remote_id":remote}

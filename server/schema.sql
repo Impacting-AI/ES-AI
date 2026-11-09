@@ -91,3 +91,64 @@ CREATE TABLE IF NOT EXISTS feedback_versions(proposal_id text REFERENCES improve
 ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS diagnostics jsonb NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS generation_id text;
 ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS generation_until timestamptz;
+
+ALTER TABLE project_links ADD COLUMN IF NOT EXISTS mapping_id uuid NOT NULL DEFAULT gen_random_uuid();
+CREATE UNIQUE INDEX IF NOT EXISTS project_mapping_identity ON project_links(mapping_id);
+ALTER TABLE project_links ADD COLUMN IF NOT EXISTS external_id text;
+ALTER TABLE project_links ADD COLUMN IF NOT EXISTS resource_name text;
+ALTER TABLE project_links ADD COLUMN IF NOT EXISTS resource_url text;
+ALTER TABLE project_links ADD COLUMN IF NOT EXISTS verified_at timestamptz;
+ALTER TABLE project_links ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
+ALTER TABLE project_links ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+ALTER TABLE project_links ADD COLUMN IF NOT EXISTS last_sync timestamptz;
+ALTER TABLE project_links ADD COLUMN IF NOT EXISTS last_full timestamptz;
+ALTER TABLE project_links ADD COLUMN IF NOT EXISTS scan_started timestamptz;
+ALTER TABLE project_links ADD COLUMN IF NOT EXISTS scan_cursor text NOT NULL DEFAULT '';
+ALTER TABLE project_links ADD COLUMN IF NOT EXISTS scan_full boolean NOT NULL DEFAULT true;
+ALTER TABLE project_links ADD COLUMN IF NOT EXISTS queued boolean NOT NULL DEFAULT true;
+ALTER TABLE delivery_events ADD COLUMN IF NOT EXISTS mapping_id uuid NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000';
+-- Historical rows lacking provenance remain archived. The worker fetches fresh rows.
+DO $$ BEGIN
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='delivery_events'::regclass
+     AND contype='p' AND pg_get_constraintdef(oid) LIKE '%mapping_id%') THEN
+   ALTER TABLE delivery_events DROP CONSTRAINT delivery_events_pkey;
+   ALTER TABLE delivery_events ADD PRIMARY KEY(pid,service,mapping_id,remote_id);
+ END IF;
+END $$;
+CREATE OR REPLACE VIEW mapped_delivery_events AS
+ SELECT e.* FROM delivery_events e JOIN project_links l USING(pid,service,mapping_id)
+ JOIN agent_settings a ON a.agent_id='pm-ai-es'
+ WHERE l.verified_at IS NOT NULL AND
+ ((l.service='Jira' AND l.workspace=a.policy->>'jira_site' AND coalesce((a.policy->>'sync_jira')::boolean,true))
+ OR (l.service='Slack' AND l.workspace=a.policy->>'slack_team' AND coalesce((a.policy->>'sync_slack')::boolean,true)));
+
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS connections_changed timestamptz;
+CREATE OR REPLACE FUNCTION mark_project_connection_change() RETURNS trigger AS $$
+BEGIN
+ IF TG_OP='DELETE' THEN UPDATE projects SET connections_changed=clock_timestamp() WHERE id=OLD.pid;
+ ELSE UPDATE projects SET connections_changed=clock_timestamp() WHERE id=NEW.pid; END IF;
+ UPDATE chat_threads SET summary='',generation_id=NULL,generation_until=NULL WHERE pid=CASE WHEN TG_OP='DELETE' THEN OLD.pid ELSE NEW.pid END;
+ RETURN NULL;
+END; $$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS mapping_changed ON project_links;
+CREATE TRIGGER mapping_changed AFTER INSERT OR DELETE OR UPDATE OF mapping_id ON project_links FOR EACH ROW EXECUTE FUNCTION mark_project_connection_change();
+
+CREATE OR REPLACE FUNCTION invalidate_provider_links() RETURNS trigger AS $$
+BEGIN
+ UPDATE project_links SET mapping_id=gen_random_uuid(),last_sync=NULL,verified_at=NULL,queued=true,poll_after=now(),scan_cursor='',scan_started=NULL,last_full=NULL,
+ sync_status='Credential changed. Verify connection.' WHERE service=NEW.service;
+ RETURN NULL;
+END; $$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS provider_key_changed ON agent_credentials;
+CREATE TRIGGER provider_key_changed AFTER INSERT OR UPDATE OF encrypted ON agent_credentials FOR EACH ROW EXECUTE FUNCTION invalidate_provider_links();
+
+CREATE OR REPLACE FUNCTION invalidate_workspace_links() RETURNS trigger AS $$
+BEGIN
+ UPDATE project_links SET mapping_id=gen_random_uuid(),verified_at=NULL,queued=true,poll_after=now(),scan_cursor='',scan_started=NULL,
+ last_full=NULL,last_sync=NULL,sync_status='Workspace changed. Verify connection.'
+ WHERE (service='Jira' AND (OLD.policy->>'jira_site',OLD.policy->>'jira_email') IS DISTINCT FROM (NEW.policy->>'jira_site',NEW.policy->>'jira_email'))
+ OR (service='Slack' AND OLD.policy->>'slack_team' IS DISTINCT FROM NEW.policy->>'slack_team');
+ RETURN NULL;
+END; $$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS provider_workspace_changed ON agent_settings;
+CREATE TRIGGER provider_workspace_changed AFTER UPDATE OF policy ON agent_settings FOR EACH ROW EXECUTE FUNCTION invalidate_workspace_links();

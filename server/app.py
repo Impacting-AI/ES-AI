@@ -77,7 +77,7 @@ def audit(db, uid, pid, action, subject):
 
 @app.middleware("http")
 async def boundary(request: Request, call_next):
-    if request.method not in {"GET","HEAD","OPTIONS"} and request.headers.get("origin") != PUBLIC:
+    if request.method not in {"GET","HEAD","OPTIONS"} and request.headers.get("origin") != PUBLIC and request.url.path not in {"/api/hooks/Jira","/api/hooks/Slack"}:
         return Response("Origin rejected",status_code=403)
     try:
         response = await call_next(request)
@@ -196,8 +196,8 @@ def projects(user=Depends(uid)):
         return db.execute("""SELECT p.*, (SELECT count(*) FROM sources s WHERE s.pid=p.id) AS sources,
         (SELECT count(*) FROM plans t WHERE t.pid=p.id AND t.state='draft') AS drafts
         ,(SELECT count(*) FROM agent_actions a WHERE a.pid=p.id AND a.status='draft') AS approvals
-        ,(SELECT count(*) FROM (SELECT DISTINCT ON (record->>'issue') record FROM delivery_events WHERE pid=p.id AND service='Jira' ORDER BY record->>'issue',happened DESC) latest WHERE record->>'due'<to_char(current_date,'YYYY-MM-DD') AND lower(coalesce(nullif(record->>'status_group',''),record->>'status')) NOT IN ('done','closed','resolved')) AS overdue
-        ,(SELECT max(happened) FROM delivery_events WHERE pid=p.id) AS latest_activity
+        ,(SELECT count(*) FROM (SELECT DISTINCT ON (record->>'issue') record FROM mapped_delivery_events WHERE pid=p.id AND service='Jira' ORDER BY record->>'issue',happened DESC) latest WHERE record->>'due'<to_char(current_date,'YYYY-MM-DD') AND lower(coalesce(nullif(record->>'status_group',''),record->>'status')) NOT IN ('done','closed','resolved')) AS overdue
+        ,(SELECT max(happened) FROM mapped_delivery_events WHERE pid=p.id) AS latest_activity
         ,(SELECT config->>'frequency' FROM report_rules WHERE pid=p.id) AS report_frequency
         FROM projects p JOIN members m ON p.id=m.pid WHERE m.uid=%s AND NOT p.archived ORDER BY p.created DESC""",(user,)).fetchall()
 
@@ -495,7 +495,7 @@ def message(pid:str,data:Message,user=Depends(member)):
             audit(db,user,pid,"knowledge.saved",sid)
             return {"saved":sid}
         _,policy=agent_settings(db)
-        history=db.execute("""SELECT role,left(body,1000) AS body FROM messages WHERE pid=%s AND (thread_id IS NULL OR thread_id='legacy-'||pid) AND created>coalesce((SELECT max(created) FROM audit WHERE pid=%s AND action='source.approved'),'-infinity'::timestamptz) ORDER BY created DESC LIMIT %s""",(pid,pid,policy.history_messages)).fetchall()[::-1]
+        history=db.execute("""SELECT role,left(body,1000) AS body FROM messages WHERE pid=%s AND (thread_id IS NULL OR thread_id='legacy-'||pid) AND created>coalesce((SELECT connections_changed FROM projects WHERE id=messages.pid),'-infinity') AND created>coalesce((SELECT max(created) FROM audit WHERE pid=%s AND action='source.approved'),'-infinity'::timestamptz) ORDER BY created DESC LIMIT %s""",(pid,pid,policy.history_messages)).fetchall()[::-1]
         history=history[-policy.history_messages:] if policy.history_messages else []
     intent=plan_turn(ask,user,pid,data.body,history)
     with database() as db:
@@ -613,7 +613,7 @@ def report(pid:str,start:date,end:date,user=Depends(member)):
     after=datetime.combine(end,datetime.min.time(),timezone.utc)+timedelta(days=1)
     with database() as db:
         events=db.execute("SELECT id,created,action,subject FROM audit WHERE pid=%s AND created>=%s AND created<%s ORDER BY created,id",(pid,first,after)).fetchall()
-        delivery=db.execute("SELECT * FROM delivery_events WHERE pid=%s AND happened>=%s AND happened<%s ORDER BY happened",(pid,first,after)).fetchall()
+        delivery=db.execute("SELECT * FROM mapped_delivery_events WHERE pid=%s AND happened>=%s AND happened<%s ORDER BY happened",(pid,first,after)).fetchall()
     return {"period":[start,end],"events":events,"delivery":delivery,"verified_delivery":None}
 
 

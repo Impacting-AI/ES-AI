@@ -30,7 +30,7 @@ class ExternalAction(BaseModel):
 def checked(response):
     response.raise_for_status()
     data=response.json()
-    if data.get("ok") is False: raise failure(400,response.body)
+    if isinstance(data,dict) and data.get("ok") is False: raise failure(400,response.body)
     return data
 
 def slack_identity(c,policy,key):

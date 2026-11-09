@@ -33,14 +33,14 @@ def thread(db,pid,tid,uid,lock=False):
 
 def activity_context(db, pid, policy, query):
     from .domain import retrieve
-    activity = db.execute("""SELECT e.service,e.remote_id,e.record,e.happened FROM delivery_events e JOIN project_links l ON l.pid=e.pid AND l.service=e.service WHERE e.pid=%s AND ((e.service='Jira' AND %s AND l.workspace=%s) OR (e.service='Slack' AND %s AND l.workspace=%s)) ORDER BY happened DESC LIMIT 80""",(pid,bool(policy.sync_jira and secret(db,'Jira')),policy.jira_site,bool(policy.sync_slack and secret(db,'Slack')),policy.slack_team)).fetchall()
+    activity = db.execute("""SELECT e.service,e.remote_id,e.record,e.happened FROM mapped_delivery_events e JOIN project_links l ON l.pid=e.pid AND l.service=e.service WHERE e.pid=%s AND ((e.service='Jira' AND %s AND l.workspace=%s) OR (e.service='Slack' AND %s AND l.workspace=%s)) ORDER BY ts_rank(to_tsvector('english',e.record::text),websearch_to_tsquery('english',%s)) DESC,happened DESC LIMIT 80""",(pid,bool(policy.sync_jira and secret(db,'Jira')),policy.jira_site,bool(policy.sync_slack and secret(db,'Slack')),policy.slack_team,query)).fetchall()
     records = [
-        dict(id=row['service']+'-'+row['remote_id'], title=row['service']+' activity',
-             state='recorded', kind='activity', body=json.dumps(row['record'], default=str),
+        dict(id=row['service']+'-'+row['remote_id'], title=('Slack channel discussion (unapproved)' if row['service']=='Slack' else 'Jira issue activity'),
+             state='recorded', kind='activity', body=str(row['happened'])+' '+json.dumps(row['record'], default=str),
              happened=str(row['happened']))
         for row in activity
     ]
-    return retrieve(records, query, min(2, policy.context_passages))
+    return sorted(retrieve(records, query, min(4, policy.context_passages)),key=lambda row:row["happened"])
 
 def router(member,ask,evidence,add_source):
     r=APIRouter(prefix="/api/projects/{pid}/chats")
@@ -120,7 +120,7 @@ def router(member,ask,evidence,add_source):
                 db.execute("UPDATE chat_threads SET title=CASE WHEN title='New chat' THEN %s ELSE title END,revision=revision+1,updated=now() WHERE id=%s",(data.body[:70],tid))
                 db.execute("INSERT INTO audit(uid,pid,action,subject) VALUES(%s,%s,'knowledge.saved',%s)",(user,pid,sid))
                 return {"saved":sid}
-            recent=db.execute("SELECT role,body,refs FROM messages WHERE pid=%s AND thread_id=%s ORDER BY created DESC,id DESC LIMIT %s",(pid,tid,p.history_messages)).fetchall()[::-1]
+            recent=db.execute("SELECT role,body,refs FROM messages m WHERE pid=%s AND thread_id=%s AND m.created>coalesce((SELECT connections_changed FROM projects WHERE id=m.pid),'-infinity') ORDER BY created DESC,id DESC LIMIT %s",(pid,tid,p.history_messages)).fetchall()[::-1]
             history=[dict(role=m['role'],body=(clean_text(m['body']) if m['role']=='assistant' else m['body'])[:1300]) for m in recent]
             lease=str(uuid4())
             locked=db.execute("""UPDATE chat_threads SET generation_id=%s,generation_until=now()+interval '12 minutes'
@@ -168,7 +168,7 @@ def router(member,ask,evidence,add_source):
                     from .domain import retrieve
                     memory=retrieve([dict(id=x['id'],state='draft',title=x['title'],body=x['summary']) for x in past],query,2)
                     prompt+="\nConversation memory (unverified): "+clean_text((t['summary']+ '\n'+'\n'.join(m['body'][:650] for m in memory))[:4800])
-                    old=db.execute("""SELECT id,role,body FROM messages WHERE pid=%s AND thread_id=%s AND id NOT IN (SELECT id FROM messages WHERE pid=%s AND thread_id=%s ORDER BY created DESC,id DESC LIMIT %s) AND to_tsvector('simple',body) @@ plainto_tsquery('simple',%s) ORDER BY created DESC LIMIT 40""",(pid,tid,pid,tid,p.history_messages,query)).fetchall()
+                    old=db.execute("""SELECT id,role,body FROM messages m WHERE m.created>coalesce((SELECT connections_changed FROM projects WHERE id=m.pid),'-infinity') AND pid=%s AND thread_id=%s AND id NOT IN (SELECT id FROM messages m WHERE pid=%s AND thread_id=%s AND m.created>coalesce((SELECT connections_changed FROM projects WHERE id=m.pid),'-infinity') ORDER BY created DESC,id DESC LIMIT %s) AND to_tsvector('simple',body) @@ plainto_tsquery('simple',%s) ORDER BY created DESC LIMIT 40""",(pid,tid,pid,tid,p.history_messages,query)).fetchall()
                     related=retrieve([dict(id=m['id'],title=m['role'],body=m['body'][:900],state='recorded') for m in old],query,2)
                     prompt+="\nEarlier matching conversation excerpts (unverified): "+json.dumps([r['body'] for r in related])
         except Exception:
@@ -189,7 +189,7 @@ def router(member,ask,evidence,add_source):
                         current=thread(db,pid,tid,user,True)
                         if current['revision']!=data.revision or current['archived'] or current['generation_id']!=lease or stopped.is_set():raise HTTPException(409,"Another turn changed this chat. Refresh and retry.")
                         save(db,'user',data.body,[],attachments);save(db,'assistant',answer,cites,[])
-                        older=db.execute("SELECT role,body,refs FROM messages WHERE pid=%s AND thread_id=%s ORDER BY created DESC,id DESC LIMIT 30",(pid,tid)).fetchall()[::-1]
+                        older=db.execute("SELECT role,body,refs FROM messages m WHERE pid=%s AND thread_id=%s AND m.created>coalesce((SELECT connections_changed FROM projects WHERE id=m.pid),'-infinity') ORDER BY created DESC,id DESC LIMIT 30",(pid,tid)).fetchall()[::-1]
                         db.execute("UPDATE chat_threads SET title=CASE WHEN title='New chat' THEN %s ELSE title END,summary=%s,updated=now(),revision=revision+1 WHERE id=%s",(data.body[:70],(digest(older[:-6] or older,current["summary"])),tid))
                         db.execute("INSERT INTO audit(uid,pid,action,subject) VALUES(%s,%s,'chat.answered',%s)",(user,pid,model))
                     send("done",dict(model=model,fallback=model!=p.model))
