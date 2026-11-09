@@ -23,8 +23,8 @@ export default function ChatMessage({body,copy}:{body:string,copy:(v:string)=>vo
    out.push(<div className="scroll" key={k}><table><thead><tr>{cells(line).map((v,j)=><th key={j}>{inline(v)}</th>)}</tr></thead><tbody>{rows.map((r,j)=><tr key={j}>{r.map((v,n)=><td key={n}>{inline(v)}</td>)}</tr>)}</tbody></table></div>);continue
   }
   if(/^#{1,6} /.test(line)){out.push(<h3 key={k}>{inline(line.replace(/^#+ /,''))}</h3>);continue}
-  const list=line.match(/^\s*(?:[-*]|(\d+)\.)\s+(.*)/)
-  if(list){const listItems=[list[2]],pattern=list[1]?/^\s*\d+\.\s+(.*)/:/^\s*[-*]\s+(.*)/;while(i<lines.length&&pattern.test(lines[i]))listItems.push(lines[i++].match(pattern)![1]);const Tag=list[1]?'ol':'ul';out.push(<Tag key={k}>{listItems.map((v,j)=><li key={j}>{inline(v)}</li>)}</Tag>);continue}
+  const list=line.match(/^\s*(?:[-*•]|(\d+)\.)\s+(.*)/)
+  if(list){const listItems=[list[2]],pattern=list[1]?/^\s*\d+\.\s+(.*)/:/^\s*[-*•]\s+(.*)/;while(i<lines.length&&pattern.test(lines[i]))listItems.push(lines[i++].match(pattern)![1]);const Tag=list[1]?'ol':'ul';out.push(<Tag key={k}>{listItems.map((v,j)=><li key={j}>{inline(v)}</li>)}</Tag>);continue}
   out.push(<p key={k}>{inline(line)}</p>)
  }
  return <div className="chat-prose">{out}</div>

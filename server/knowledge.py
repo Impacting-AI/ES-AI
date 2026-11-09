@@ -73,6 +73,18 @@ def select_context(rows,question,history,limit,*,breadth=None):
     groups=defaultdict(list)
     for row in sorted(eligible,key=lambda r:(r['state']!='approved',not any(v in str(r.get('category','')).casefold() for v in ('agreement','scope','contract')),r.get('sid',r['id']),r.get('position',0))):
         groups[row.get('sid',row['id'])].append(row)
+    if breadth is True:
+        # Sample the opening, distinct milestone headings and later sections of each source.
+        # Long specifications often introduce the final delivery phase near the end.
+        for sid,group in groups.items():
+            headings={}
+            for row in group:
+                for label in re.findall(r"(?im)^\s*(?:#+\s*)?((?:milestone|phase|stage)\s+\d+)\b",row["body"]):
+                    headings.setdefault(label.casefold(),row)
+            samples=min(limit,len(group))
+            spread=[group[j*(len(group)-1)//max(1,samples-1)] for j in range(samples)]
+            by_id={row["id"]:row for row in [group[0],*headings.values(),*spread,*group]}
+            groups[sid]=list(by_id.values())
     # An overview needs breadth, even when a shared category matches every passage.
     overview=bool(re.search(r"\b(summari[sz]e|overview|summar[yise]+|documents|milestones)\b",question,re.I))
     if breadth is not None:

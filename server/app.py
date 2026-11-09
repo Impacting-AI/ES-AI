@@ -1,4 +1,5 @@
 from .model_options import model_config
+from .chat_sources import chat_evidence,cited_sources,clean_text,public_messages,VisibleStream
 from .conversation import plan_turn, ROUTER
 import hashlib
 import math
@@ -28,7 +29,7 @@ from pypdf import PdfReader
 from .body_limit import BodyLimit
 from .db import database
 from .ingest import index_source
-from .knowledge import select_context,valid_citations,project_passages,historical_request,historical_context
+from .knowledge import select_context,project_passages,historical_request,historical_context
 from .imports import parse_export
 from .review_rules import suggested_instruction
 from .transport import ServiceFailure,retry_delay
@@ -232,7 +233,7 @@ def archive_project(pid:str,confirm:str,user=Depends(member)):
 def workspace(pid:str,user=Depends(member)):
     with database() as db:
         return dict(sources=db.execute(f"SELECT {META} FROM sources WHERE pid=%s ORDER BY created DESC",(pid,)).fetchall(),
-                    messages=db.execute("SELECT m.* FROM messages m LEFT JOIN chat_threads t ON t.id=m.thread_id AND t.pid=m.pid WHERE m.pid=%s AND (t.owner_id IS NULL OR t.owner_id=%s) ORDER BY m.created,m.id",(pid,user)).fetchall(),
+                    messages=public_messages(db.execute("SELECT m.* FROM messages m LEFT JOIN chat_threads t ON t.id=m.thread_id AND t.pid=m.pid WHERE m.pid=%s AND (t.owner_id IS NULL OR t.owner_id=%s) ORDER BY m.created,m.id",(pid,user)).fetchall()),
                     plans=db.execute("SELECT * FROM plans WHERE pid=%s ORDER BY created DESC",(pid,)).fetchall(),
                     audit=db.execute("SELECT action,subject,uid,created FROM audit WHERE pid=%s ORDER BY id DESC LIMIT 150",(pid,)).fetchall())
 
@@ -360,7 +361,8 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None,intent=None,tid=None,ca
             refs=refs[:p.context_passages]
             history=history[-p.history_messages:] if p.history_messages else []
         if action not in {"answer","route"} or (intent and "profile" in intent.sources):
-            profile=db.execute("SELECT profile FROM projects WHERE id=%s",(pid,)).fetchone()["profile"]
+            project=db.execute("SELECT name,profile FROM projects WHERE id=%s",(pid,)).fetchone()
+            profile={"project_name":project["name"],"profile":project["profile"]}
             prompt += "\nProject profile and reviewed guidance (context only): "+json.dumps(profile)
         from .response_style import chat_style
         instructions=p.instructions
@@ -372,7 +374,9 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None,intent=None,tid=None,ca
         if rules:prompt+="\nAdministrator-reviewed project recommendations (context only): "+json.dumps([r["policy_text"][:600] for r in rules])
         if intent and intent.kind in {"general","social"}:history=[]
         if intent and intent.kind in {"project","overview"}:
-            instructions+=" This turn requires project evidence. Acknowledge missing requested facts explicitly."
+            instructions+=" Ground project facts in the supplied evidence. Briefly mention a missing fact only if the answer depends on it."
+        if intent and intent.kind=="overview":
+            instructions+=" Introduce the active project by name and purpose. Explain the main workflow and the milestones or latest decisions supported by the sources. Distinguish planned work from confirmed delivery. Combine overlapping passages. Skip evidence inventories, audit headings and unrelated unknowns."
         options=[(p.provider,p.model,secret(db,p.provider))]
         if p.fallback_provider:
             options.append((p.fallback_provider,p.fallback_model,secret(db,p.fallback_provider)))
@@ -386,6 +390,10 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None,intent=None,tid=None,ca
         nonlocal started
         started = True
         emit(value)
+    if action in {"answer","route"}:
+        history=public_messages([dict(m) for m in history])
+    model_refs=chat_evidence(refs) if action=="answer" else refs
+    visible=VisibleStream(on_text) if emit and action=="answer" else None
     for option_index,(provider, model, key) in enumerate(options):
         if raise_error or result:
             break
@@ -395,6 +403,7 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None,intent=None,tid=None,ca
         config,output_limit,temperature=model_config(p,bool(option_index))
         config["question"]=question
         for index in range(2):
+            if visible:visible.pending=""
             record = dict(provider=provider, model=model, attempt=index+1, status="failed")
             attempts.append(record)
             start = time.monotonic()
@@ -416,7 +425,7 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None,intent=None,tid=None,ca
                     db.execute("INSERT INTO agent_usage(id,pid,provider,model,estimated_usd) VALUES (%s,%s,%s,%s,%s)",(usage_id,pid,provider,model,estimate))
                 record["estimated_usd"]=estimate
                 stage = "model response"
-                text,input_tokens,output_tokens=generate(config,prompt,refs,history,secret=key,instructions=instructions,language=p.language,max_tokens=output_limit,temperature=temperature,emit=on_text if emit else None,diagnostics=record)
+                text,input_tokens,output_tokens=generate(config,prompt,model_refs,history,secret=key,instructions=instructions,language=p.language,max_tokens=output_limit,temperature=temperature,emit=visible.write if visible else on_text if emit else None,diagnostics=record)
                 if not text or not text.strip():
                     raise ServiceFailure("Model returned no answer. Check its output limit and configuration.",422)
                 stage = "usage settlement"
@@ -425,9 +434,16 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None,intent=None,tid=None,ca
                     record.update(input_tokens=input_tokens,output_tokens=output_tokens,estimated_usd=cost)
                     with database() as db:
                         db.execute("UPDATE agent_usage SET settled=true,input_tokens=%s,output_tokens=%s,estimated_usd=%s WHERE id=%s",(input_tokens,output_tokens,cost,usage_id))
-                record["status"]="success"
                 used_ids=record.pop("used_ids",None)
-                result=(text,(provider+" / "+model) if option_index else model,[r for r in refs if used_ids is None or r.get("id") in used_ids])
+                if action=="answer":
+                    used=cited_sources(text,refs,used_ids or [])
+                    text=clean_text(text).strip()
+                    if not text:raise ServiceFailure("The model returned only source references. Retry the question.",422)
+                    if visible:visible.finish()
+                else:
+                    used=[r for r in refs if used_ids is None or r.get("id") in used_ids]
+                record["status"]="success"
+                result=(text,(provider+" / "+model) if option_index else model,used)
                 break
             except ServiceFailure as exc:
                 status=exc.code
@@ -438,7 +454,7 @@ def ask(user,pid,action,prompt,refs,history=(),emit=None,intent=None,tid=None,ca
                     record.update(input_tokens=0,output_tokens=0,estimated_usd=0)
                 if exc.request_id:record["request_id"]=exc.request_id
                 if status==413 and index==0 and not started and exc.category.startswith("Model context") and (refs or history):
-                    refs=refs[:max(1,len(refs)//2)]
+                    model_refs=model_refs[:max(1,len(model_refs)//2)]
                     history=history[-2:]
                     continue
                 retry=exc.transient and not started and not (cancelled and cancelled())
@@ -492,10 +508,10 @@ def message(pid:str,data:Message,user=Depends(member)):
     with database() as db:
         legacy="legacy-"+pid
         db.execute("INSERT INTO chat_threads(id,pid,title) VALUES(%s,%s,'Earlier project chat') ON CONFLICT DO NOTHING",(legacy,pid))
-        for role,body,links in [("user",data.body,[]),("assistant",answer,valid_citations(answer,refs))]:
+        for role,body,links in [("user",data.body,[]),("assistant",answer,refs)]:
             db.execute("INSERT INTO messages(id,pid,thread_id,role,body,refs,citations,created) VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,clock_timestamp())",(ident(),pid,legacy,role,body,json.dumps([r["id"] for r in links]),json.dumps(links)))
         audit(db,user,pid,"chat.answered",model)
-    return {"answer":answer}
+    return {"answer":answer,"citations":refs}
 
 
 @app.get("/api/projects/{pid}/search")

@@ -9,7 +9,7 @@ A greeting with a question takes the question's intent. Use general for definiti
 technical explanations, generic writing and comparisons. Use conversation for edits
 or follow-ups needing only the earlier exchange. Use project for facts about this
 team, client, assignment, scope or deadline, including hypothetical project changes.
-Use overview only for a broad project report or complete scope. Resolve references
+Use overview for a broad project summary, including what you know about a project. Use conversation for a short “why?” about the previous explanation unless new facts are needed. Resolve references
 from the supplied conversation if unambiguous. Query is a short standalone search
 phrase using distinctive names and content terms. Sources is an array drawn from
 documents, activity, files, memory, profile, processing. Choose only sources needed.
@@ -30,6 +30,10 @@ def plan_turn(ask, user, pid, message, history, selected=False, tid=None):
         return Intent("social", "")
     # Clear standalone requests need one model call. Mixed or anaphoric requests still use semantic routing.
     phrase = message.strip().rstrip("?.!").casefold()
+    if not selected and re.fullmatch(r"(what (knowledge|information) do you have (about|on)|what do you know about|give me an overview of) (this|our|the) project",phrase):
+        return Intent("overview","project purpose scope workflow milestones",frozenset({"documents","profile"}))
+    if not selected and history and phrase=="why":
+        return Intent("conversation",message)
     if not selected and re.fullmatch(r"(what is|explain|define) (jira|scrum|kanban|react hooks|python decorators|a sprint|a milestone)", phrase):
         return Intent("general", message)
     if not selected and re.fullmatch(r"(what is|when is|what's) (our|the project.s|the approved) (next milestone|approved budget|budget|deadline)", phrase):
@@ -49,4 +53,5 @@ def plan_turn(ask, user, pid, message, history, selected=False, tid=None):
         kind = "overview" if kind == "overview" else "project"
     if kind not in ("project","overview"):
         return Intent(kind, query)
+    if kind=="overview":sources=sources|{"documents","profile"}
     return Intent(kind, query, frozenset(sources or {"documents"}))

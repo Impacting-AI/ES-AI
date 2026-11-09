@@ -5,11 +5,12 @@ from uuid import uuid4
 from fastapi import APIRouter,Depends,File,HTTPException,UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel,Field
+from .chat_sources import clean_text,public_messages
 from .conversation import plan_turn
 from .transport import ServiceFailure
 from .chat_errors import chat_error
 from .chat_memory import digest
-from .knowledge import process,select_context,valid_citations
+from .knowledge import process,select_context
 from .db import database
 from .agent_store import settings,secret
 
@@ -61,7 +62,7 @@ def router(member,ask,evidence,add_source):
     def read(pid:str,tid:str,user=Depends(member)):
         with database() as db:
             t=thread(db,pid,tid,user)
-            return dict(t,messages=db.execute("SELECT * FROM messages WHERE pid=%s AND thread_id=%s ORDER BY created,id",(pid,tid)).fetchall())
+            return dict(t,messages=public_messages(db.execute("SELECT * FROM messages WHERE pid=%s AND thread_id=%s ORDER BY created,id",(pid,tid)).fetchall()))
 
     @r.patch("/{tid}")
     def update(pid:str,tid:str,data:Edit,user=Depends(member)):
@@ -120,7 +121,7 @@ def router(member,ask,evidence,add_source):
                 db.execute("INSERT INTO audit(uid,pid,action,subject) VALUES(%s,%s,'knowledge.saved',%s)",(user,pid,sid))
                 return {"saved":sid}
             recent=db.execute("SELECT role,body,refs FROM messages WHERE pid=%s AND thread_id=%s ORDER BY created DESC,id DESC LIMIT %s",(pid,tid,p.history_messages)).fetchall()[::-1]
-            history=[dict(role=m['role'],body=m['body'][:1300]) for m in recent]
+            history=[dict(role=m['role'],body=(clean_text(m['body']) if m['role']=='assistant' else m['body'])[:1300]) for m in recent]
             lease=str(uuid4())
             locked=db.execute("""UPDATE chat_threads SET generation_id=%s,generation_until=now()+interval '12 minutes'
                 WHERE id=%s AND pid=%s AND revision=%s AND NOT archived
@@ -166,7 +167,7 @@ def router(member,ask,evidence,add_source):
                     past=db.execute("SELECT id,title,summary FROM chat_threads WHERE pid=%s AND owner_id=%s AND id<>%s AND NOT archived AND summary<>'' ORDER BY updated DESC LIMIT 40",(pid,user,tid)).fetchall()
                     from .domain import retrieve
                     memory=retrieve([dict(id=x['id'],state='draft',title=x['title'],body=x['summary']) for x in past],query,2)
-                    prompt+="\nConversation memory (unverified): "+(t['summary']+ '\n'+'\n'.join(m['body'][:650] for m in memory))[:4800]
+                    prompt+="\nConversation memory (unverified): "+clean_text((t['summary']+ '\n'+'\n'.join(m['body'][:650] for m in memory))[:4800])
                     old=db.execute("""SELECT id,role,body FROM messages WHERE pid=%s AND thread_id=%s AND id NOT IN (SELECT id FROM messages WHERE pid=%s AND thread_id=%s ORDER BY created DESC,id DESC LIMIT %s) AND to_tsvector('simple',body) @@ plainto_tsquery('simple',%s) ORDER BY created DESC LIMIT 40""",(pid,tid,pid,tid,p.history_messages,query)).fetchall()
                     related=retrieve([dict(id=m['id'],title=m['role'],body=m['body'][:900],state='recorded') for m in old],query,2)
                     prompt+="\nEarlier matching conversation excerpts (unverified): "+json.dumps([r['body'] for r in related])
@@ -183,7 +184,7 @@ def router(member,ask,evidence,add_source):
                 try:
                     answer,model,used=ask(user,pid,"answer",prompt,refs,history,emit=emit,intent=intent,tid=tid,cancelled=stopped.is_set,question=data.body)
                     if stopped.is_set():return
-                    cites=valid_citations(answer,used)
+                    cites=used
                     with database() as db:
                         current=thread(db,pid,tid,user,True)
                         if current['revision']!=data.revision or current['archived'] or current['generation_id']!=lease or stopped.is_set():raise HTTPException(409,"Another turn changed this chat. Refresh and retry.")

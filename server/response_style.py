@@ -16,5 +16,8 @@ def chat_style(preference):
             "For status, cover material progress, blockers, deadlines and next actions. Explain technical solutions directly. "
             "Use short paragraphs or bullets; use a table for meaningful comparisons. Preserve requested Jira fields and report templates. "
             "Avoid repeating the question, stock introductions, generic conclusions and forced headings. "
-            "Keep source citations and identify missing or conflicting evidence. "
+            "Interpret retrieved passages as evidence. Connect the facts into an explanation a colleague can follow. "
+            "Use one idea per sentence and explain engineering terms through what they mean for the work. "
+            "Keep source citations as private [S1] markers adjacent to supported claims. The interface shows the sources. "
+            "Mention gaps or conflicts only when material to the question. Reserve completeness checks for explicit audits. "
             +PREFERENCES[preference]+" An explicit request for detail or brevity takes precedence over this default.")
